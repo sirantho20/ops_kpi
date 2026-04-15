@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script>
+        window.FontAwesomeConfig = {
+            autoReplaceSvg: 'nest'
+        };
+    </script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Operations Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.plot.ly/plotly-3.1.1.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc;
+        }
+
+        .table-cell {
+            padding: 4px 8px;
+            text-align: center;
+            border: 1px solid #e2e8f0;
+            font-size: 0.75rem;
+        }
+
+        .table-header {
+            background-color: #f1f5f9;
+            font-weight: 600;
+        }
+
+        .bg-mtd { background-color: #e0f2fe; }
+        .bg-mttr { background-color: #ffedd5; }
+        .bg-avail { background-color: #dcfce7; }
+        .bg-cm { background-color: #f3e8ff; }
+        .bg-visit { background-color: #fce7f3; }
+
+        .text-danger { color: #ef4444; }
+        .text-warning { color: #f59e0b; }
+        .na-cell {
+            color: #94a3b8;
+            font-style: italic;
+        }
+        .row-region td {
+            background-color: #f1f5f9;
+            border-top: 2px solid #cbd5e1;
+        }
+        .row-region td:first-child {
+            text-align: left;
+            font-weight: 700;
+            color: #0f172a;
+        }
+        .row-region .table-cell {
+            cursor: default;
+        }
+        .row-zoo td {
+            background-color: #ffffff;
+        }
+        .row-zoo td:first-child {
+            text-align: left;
+            color: #334155;
+            font-weight: 500;
+        }
+        .row-group-end td {
+            border-bottom: 2px solid #e2e8f0;
+        }
+        .sfe-cell {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+        .sfe-region-pill {
+            font-size: 0.625rem;
+            line-height: 1;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            padding: 4px 6px;
+            border-radius: 9999px;
+            background-color: #e2e8f0;
+            color: #334155;
+            flex-shrink: 0;
+        }
+        .sfe-label {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .sfe-level-0 {
+            padding-left: 0;
+        }
+        .sfe-level-1 {
+            padding-left: 22px;
+        }
+        .sfe-indent {
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+            color: #94a3b8;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .sfe-toggle {
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+            color: #475569;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .sfe-region-trigger {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+            border: 0;
+            background: transparent;
+            padding: 0;
+            color: inherit;
+            font: inherit;
+            cursor: pointer;
+        }
+        .sfe-region-trigger:focus-visible {
+            outline: 2px solid #2563eb;
+            outline-offset: 2px;
+            border-radius: 4px;
+        }
+        .chart-placeholder {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 120px;
+            text-align: center;
+            font-size: 11px;
+            color: #64748b;
+            line-height: 1.4;
+            padding: 0 8px;
+        }
+        .meta-pill {
+            border: 1px solid #e2e8f0;
+            background: #ffffff;
+            border-radius: 9999px;
+            padding: 6px 12px;
+            font-size: 0.75rem;
+            color: #475569;
+        }
+
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        .insight-cell {
+            cursor: pointer;
+        }
+        .insight-cell:hover {
+            background-color: #f1f5f9;
+        }
+        tfoot .insight-cell:hover {
+            background-color: #64748b;
+        }
+        @keyframes insight-flask {
+            0%, 100% { transform: rotate(-6deg); }
+            50% { transform: rotate(6deg); }
+        }
+        .insight-loading-flask {
+            animation: insight-flask 1.2s ease-in-out infinite;
+        }
+
+        details.regional-charts {
+            border: 1px solid #e2e8f0;
+            border-radius: 0.5rem;
+            background: #ffffff;
+            box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+        }
+        details.regional-charts > summary.regional-charts-summary {
+            list-style: none;
+            padding: 0.75rem 1rem;
+            font-weight: 600;
+            font-size: 0.875rem;
+            color: #1e293b;
+            cursor: pointer;
+            user-select: none;
+            border-bottom: 1px solid #e2e8f0;
+            background: #f8fafc;
+        }
+        details.regional-charts > summary.regional-charts-summary::-webkit-details-marker {
+            display: none;
+        }
+        details.regional-charts > summary.regional-charts-summary::before {
+            content: '▸';
+            display: inline-block;
+            margin-right: 0.5rem;
+            transition: transform 0.15s ease;
+            color: #64748b;
+        }
+        details.regional-charts[open] > summary.regional-charts-summary::before {
+            transform: rotate(90deg);
+        }
+        details.regional-charts > summary.regional-charts-summary:focus-visible {
+            outline: 2px solid #2563eb;
+            outline-offset: 2px;
+        }
+        .regional-charts-inner {
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .regional-charts-inner > div:last-child {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom-width: 0;
+        }
+    </style>
+</head>
+<body class="p-4 flex flex-col gap-6">
+    <section class="bg-white rounded-lg shadow border border-slate-200 p-4">
+        <h1 id="dashboard-title" class="text-xl font-bold text-slate-800"></h1>
+    </section>
+
+    <div id="data-table-section" class="w-full overflow-x-auto bg-white rounded-lg shadow border border-slate-200">
+        <table class="w-full min-w-max border-collapse">
+            <thead id="table-head"></thead>
+            <tbody id="table-body"></tbody>
+            <tfoot id="table-footer"></tfoot>
+        </table>
+    </div>
+
+    <div id="charts-section" class="w-full flex flex-col gap-4"></div>
+
+    <div
+        id="insight-modal"
+        class="hidden fixed inset-0 z-50 flex items-center justify-center p-4"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="insight-modal-title"
+    >
+        <div
+            id="insight-modal-backdrop"
+            class="absolute inset-0 bg-slate-900/50"
+            aria-hidden="true"
+        ></div>
+        <div
+            class="relative bg-white rounded-lg shadow-xl border border-slate-200 max-w-2xl w-full max-h-[88vh] flex flex-col"
+        >
+            <div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-200 bg-slate-50 rounded-t-lg">
+                <h2 id="insight-modal-title" class="text-lg font-semibold text-slate-800">
+                    Performance Insights
+                </h2>
+                <button
+                    type="button"
+                    id="insight-modal-dismiss"
+                    class="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                >
+                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                    Close
+                </button>
+            </div>
+            <div class="overflow-y-auto p-4 flex-1 text-sm text-slate-700">
+                <div id="insight-modal-loading" class="hidden flex flex-col items-center justify-center gap-3 py-12 text-slate-600">
+                    <i
+                        class="fa-solid fa-flask text-4xl text-violet-600 insight-loading-flask"
+                        aria-hidden="true"
+                    ></i>
+                    <p class="text-base font-medium">Doing Science</p>
+                    <p class="text-xs text-slate-500">Tracing source rows and site contributions…</p>
+                </div>
+                <div id="insight-modal-content" class="hidden space-y-4"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const dashboardData = __DASHBOARD_DATA__;
+        const metricConfigs = [
+            {
+                id: 'events',
+                title: 'EVENTS',
+                groupClass: 'bg-blue-500 text-white',
+                subHeaderClass: 'bg-mtd font-semibold',
+                targetLabel: 'Target (less 15%)'
+            },
+            {
+                id: 'mttr',
+                title: 'MTTR (mins)',
+                groupClass: 'bg-orange-500 text-white',
+                subHeaderClass: 'bg-mttr font-semibold',
+                targetLabel: 'Target (3hrs)'
+            },
+            {
+                id: 'availability',
+                title: 'AVAILABILITY (%)',
+                groupClass: 'bg-green-500 text-white',
+                subHeaderClass: 'bg-avail font-semibold',
+                targetLabel: 'Target (99.96%)'
+            },
+            {
+                id: 'cm',
+                title: 'CM COUNT',
+                groupClass: 'bg-purple-500 text-white',
+                subHeaderClass: 'bg-cm font-semibold',
+                targetLabel: 'Target (less 15%)'
+            },
+            {
+                id: 'visit',
+                title: 'VISIT COUNT',
+                groupClass: 'bg-pink-500 text-white',
+                subHeaderClass: 'bg-visit font-semibold',
+                targetLabel: 'Target (less 15%)'
+            }
+        ];
+        const tableMetricOrder = metricConfigs.map((metricConfig) => metricConfig.id);
+        const periodOrder = dashboardData.meta.periodOrder || ['TARGET'];
+        const chartRowOrder = ['Overall', 'NCR', 'NLZ', 'SLZ', 'VIS', 'MIN'];
+        const chartRowOrderRegional = chartRowOrder.filter((r) => r !== 'Overall');
+        const collapsedRegions = new Set();
+        const chartTypes = [
+            { id: 'events', title: 'Events\n(< 15%)', color1: '#3b82f6', color2: '#fb923c', isPercent: false },
+            { id: 'mttr', title: 'MTTR Performance\n(3 Hours)', color1: '#FFA500', color2: '#22c55e', isPercent: false },
+            { id: 'availability', title: 'Availability Performance\n(99.96%)', color1: '#008000', color2: '#3b82f6', isPercent: true },
+            { id: 'cm', title: 'CM Count\n(<15%)', color1: '#800080', color2: '#eab308', isPercent: false },
+            { id: 'visit', title: 'Normal Visit\n(<15%)', color1: '#FFC0CB', color2: '#f43f5e', isPercent: false }
+        ];
+
+        function escapeAttr(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/"/g, '&quot;')
+                .replace(/</g, '&lt;');
+        }
+
+        function cellMarkup(cell, extraClass = '') {
+            const classes = ['table-cell', extraClass, cell.className || '', cell.isNA ? 'na-cell' : '']
+                .filter(Boolean)
+                .join(' ');
+            return `<td class="${classes}">${cell.text}</td>`;
+        }
+
+        function metricCellMarkup(cell, extraClass, row, metricKey, periodKey) {
+            const classes = [
+                'table-cell',
+                'insight-cell',
+                extraClass,
+                cell.className || '',
+                cell.isNA ? 'na-cell' : ''
+            ]
+                .filter(Boolean)
+                .join(' ');
+            const zooAttr =
+                row.rowKind === 'zoo'
+                    ? ` data-zoo="${escapeAttr(row.label)}"`
+                    : '';
+            return `<td class="${classes}"
+                data-insight="1"
+                data-row-kind="${escapeAttr(row.rowKind)}"
+                data-region="${escapeAttr(row.region)}"
+                ${zooAttr}
+                data-metric="${escapeAttr(metricKey)}"
+                data-period="${escapeAttr(periodKey)}"
+                title="Click for Performance Insights">${cell.text}</td>`;
+        }
+
+        function buildLabelMarkup(row, cellClass = '') {
+            const levelClass = `sfe-level-${row.level || 0}`;
+            if (row.rowKind === 'region') {
+                const isExpanded = !collapsedRegions.has(row.region);
+                return `
+                    <td class="table-cell ${cellClass}">
+                        <div class="sfe-cell ${levelClass}">
+                            <button
+                                type="button"
+                                class="sfe-region-trigger"
+                                data-region="${row.region}"
+                                aria-expanded="${isExpanded}"
+                                title="${isExpanded ? 'Collapse' : 'Expand'} ${row.label}"
+                            >
+                                <span class="sfe-toggle">${isExpanded ? '▾' : '▸'}</span>
+                                <span class="sfe-label">${row.label}</span>
+                            </button>
+                        </div>
+                    </td>
+                `;
+            }
+
+            if (row.rowKind === 'footer') {
+                return `
+                    <td class="table-cell ${cellClass}">
+                        <div class="sfe-cell sfe-level-0">
+                            <span class="sfe-label">${row.label}</span>
+                        </div>
+                    </td>
+                `;
+            }
+
+            return `
+                <td class="table-cell ${cellClass}">
+                    <div class="sfe-cell ${levelClass}">
+                        <span class="sfe-indent">•</span>
+                        <span class="sfe-region-pill">${row.region || ''}</span>
+                        <span class="sfe-label">${row.label}</span>
+                    </div>
+                </td>
+            `;
+        }
+
+        function periodHeaderLabel(periodKey, metricConfig) {
+            return periodKey === 'TARGET' ? metricConfig.targetLabel : periodKey;
+        }
+
+        function renderTableHead() {
+            const tableHead = document.getElementById('table-head');
+            const groupHeaders = metricConfigs
+                .map(
+                    (metricConfig) => `
+                        <th colspan="${periodOrder.length}" class="table-cell table-header ${metricConfig.groupClass}">
+                            ${metricConfig.title}
+                        </th>
+                    `
+                )
+                .join('');
+            const periodHeaders = metricConfigs
+                .map((metricConfig) =>
+                    periodOrder
+                        .map(
+                            (periodKey) => `
+                                <th class="table-cell ${metricConfig.subHeaderClass}">
+                                    ${periodHeaderLabel(periodKey, metricConfig)}
+                                </th>
+                            `
+                        )
+                        .join('')
+                )
+                .join('');
+
+            tableHead.innerHTML = `
+                <tr>
+                    <th rowspan="2" class="table-cell table-header bg-slate-600 text-white w-24 font-bold">Region/Field Eng.</th>
+                    <th rowspan="2" class="table-cell table-header bg-slate-600 text-white w-24"># OF SITES</th>
+                    ${groupHeaders}
+                </tr>
+                <tr>${periodHeaders}</tr>
+            `;
+        }
+
+        function buildRowMarkup(row, rowClass, cellClass = '') {
+            const hiddenClass = row.rowKind === 'zoo' && collapsedRegions.has(row.region) ? 'hidden' : '';
+            const dataAttributes = [
+                `data-row-kind="${row.rowKind}"`,
+                row.region ? `data-region="${row.region}"` : '',
+                row.rowKind === 'region' ? `data-expanded="${!collapsedRegions.has(row.region)}"` : ''
+            ].filter(Boolean).join(' ');
+            let html = `<tr class="${[rowClass, hiddenClass].filter(Boolean).join(' ')}" ${dataAttributes}>`;
+            html += buildLabelMarkup(row, cellClass);
+            html += cellMarkup(row.siteCount, cellClass);
+            tableMetricOrder.forEach((metricKey) => {
+                periodOrder.forEach((periodKey) => {
+                    html += metricCellMarkup(row[metricKey][periodKey], cellClass, row, metricKey, periodKey);
+                });
+            });
+            html += '</tr>';
+            return html;
+        }
+
+        function renderMeta() {
+            document.getElementById('dashboard-title').textContent = dashboardData.meta.title;
+        }
+
+        function renderTable() {
+            const tableBody = document.getElementById('table-body');
+            const tableFooter = document.getElementById('table-footer');
+
+            tableBody.innerHTML = dashboardData.table.rows
+                .map((row) => {
+                    const rowClass = [
+                        row.rowKind === 'region' ? 'row-region font-bold' : 'row-zoo',
+                        row.groupEnd ? 'row-group-end' : ''
+                    ].filter(Boolean).join(' ');
+                    return buildRowMarkup(row, rowClass);
+                })
+                .join('');
+
+            tableFooter.innerHTML = buildRowMarkup(
+                dashboardData.table.footer,
+                'bg-slate-500 text-white font-bold',
+                'border-slate-600'
+            );
+        }
+
+        function toggleRegion(region) {
+            if (!region) {
+                return;
+            }
+            if (collapsedRegions.has(region)) {
+                collapsedRegions.delete(region);
+            } else {
+                collapsedRegions.add(region);
+            }
+            renderTable();
+        }
+
+        function handleTableToggle(event) {
+            const trigger = event.target.closest('.sfe-region-trigger');
+            if (!trigger) {
+                return;
+            }
+            toggleRegion(trigger.dataset.region);
+        }
+
+        const insightModal = document.getElementById('insight-modal');
+        const insightLoading = document.getElementById('insight-modal-loading');
+        const insightContent = document.getElementById('insight-modal-content');
+        const insightDismiss = document.getElementById('insight-modal-dismiss');
+        const insightBackdrop = document.getElementById('insight-modal-backdrop');
+        let insightFocusBefore = null;
+
+        function closeInsightModal() {
+            insightModal.classList.add('hidden');
+            insightLoading.classList.add('hidden');
+            insightContent.classList.add('hidden');
+            insightContent.innerHTML = '';
+            if (insightFocusBefore && typeof insightFocusBefore.focus === 'function') {
+                insightFocusBefore.focus();
+            }
+            insightFocusBefore = null;
+        }
+
+        function metricTitle(id) {
+            const found = metricConfigs.find((m) => m.id === id);
+            return found ? found.title : id;
+        }
+
+        function formatMeetsTarget(m) {
+            if (m === true) {
+                return 'Yes';
+            }
+            if (m === false) {
+                return 'No';
+            }
+            return '—';
+        }
+
+        function renderInsightHtml(data) {
+            if (data.error) {
+                return `<p class="text-red-600">${escapeAttr(data.error)}</p>`;
+            }
+            const parts = [];
+            parts.push(`<p class="text-slate-600">${escapeAttr(data.summary || '')}</p>`);
+            const actualStr =
+                data.actual === null || data.actual === undefined
+                    ? '—'
+                    : escapeAttr(String(data.actual));
+            const targetStr =
+                data.target === null || data.target === undefined
+                    ? '—'
+                    : escapeAttr(String(data.target));
+            parts.push(
+                `<dl class="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:text-sm border border-slate-200 rounded-md p-3 bg-slate-50">
+                    <dt class="font-medium text-slate-500">Metric</dt><dd>${escapeAttr(metricTitle(data.metric))}</dd>
+                    <dt class="font-medium text-slate-500">Period</dt><dd>${escapeAttr(data.period)}</dd>
+                    <dt class="font-medium text-slate-500">Scope</dt><dd>${escapeAttr(data.scope_label || '')}</dd>
+                    <dt class="font-medium text-slate-500">Actual</dt><dd>${actualStr}</dd>
+                    <dt class="font-medium text-slate-500">Target</dt><dd>${targetStr}</dd>
+                    <dt class="font-medium text-slate-500">Meets target</dt><dd>${escapeAttr(formatMeetsTarget(data.meets_target))}</dd>
+                </dl>`
+            );
+            if (data.target_explanation) {
+                parts.push(
+                    `<div class="rounded-md border border-violet-200 bg-violet-50 p-3 text-xs sm:text-sm text-slate-700">
+                        <div class="font-semibold text-violet-900 mb-1">Target rationale</div>
+                        <p>${escapeAttr(data.target_explanation)}</p>
+                    </div>`
+                );
+            }
+            if (data.top_contributors && data.top_contributors.length) {
+                const rows = data.top_contributors
+                    .map(
+                        (r) =>
+                            `<tr><td class="text-left py-1 pr-2">${escapeAttr(r.site_key)}</td>
+                            <td class="py-1 pr-2">${escapeAttr(r.pla_id)}</td>
+                            <td class="py-1 pr-2">${escapeAttr(r.ptci)}</td>
+                            <td class="text-right py-1">${escapeAttr(String(r.value))}</td>
+                            <td class="text-right py-1">${escapeAttr(String(r.pct_of_total))}%</td></tr>`
+                    )
+                    .join('');
+                parts.push(
+                    `<div>
+                        <h3 class="font-semibold text-slate-800 mb-2">Top contributing sites</h3>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-xs border-collapse">
+                                <thead><tr class="border-b border-slate-200">
+                                    <th class="text-left py-1">Site</th><th class="text-left">PLA</th><th class="text-left">PTCI</th>
+                                    <th class="text-right">Amount</th><th class="text-right">% of total</th>
+                                </tr></thead>
+                                <tbody>${rows}</tbody>
+                            </table>
+                        </div>
+                        ${
+                            data.other_contributors_total
+                                ? `<p class="text-xs text-slate-500 mt-2">Other sites combined: ${escapeAttr(
+                                      String(data.other_contributors_total)
+                                  )}</p>`
+                                : ''
+                        }
+                    </div>`
+                );
+            }
+            if (data.worst_sites && data.worst_sites.length) {
+                const rows = data.worst_sites
+                    .map(
+                        (r) =>
+                            `<tr><td class="text-left py-1 pr-2">${escapeAttr(r.site_key)}</td>
+                            <td class="py-1 pr-2">${escapeAttr(r.pla_id)}</td>
+                            <td class="py-1 pr-2">${escapeAttr(r.ptci)}</td>
+                            <td class="text-right py-1">${escapeAttr(String(r.availability_pct))}%</td>
+                            <td class="text-right py-1">${escapeAttr(String(r.weighted_minutes))}</td></tr>`
+                    )
+                    .join('');
+                parts.push(
+                    `<div>
+                        <h3 class="font-semibold text-slate-800 mb-2">Lowest availability (by site)</h3>
+                        ${
+                            data.below_target_note
+                                ? `<p class="text-xs text-slate-600 mb-2">${escapeAttr(data.below_target_note)}</p>`
+                                : ''
+                        }
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-xs border-collapse">
+                                <thead><tr class="border-b border-slate-200">
+                                    <th class="text-left py-1">Site</th><th class="text-left">PLA</th><th class="text-left">PTCI</th>
+                                    <th class="text-right">Availability %</th><th class="text-right">Weight (min)</th>
+                                </tr></thead>
+                                <tbody>${rows}</tbody>
+                            </table>
+                        </div>
+                    </div>`
+                );
+            }
+            if (data.highest_mttr_sites && data.highest_mttr_sites.length) {
+                const rows = data.highest_mttr_sites
+                    .map(
+                        (r) =>
+                            `<tr><td class="text-left py-1 pr-2">${escapeAttr(r.site_key)}</td>
+                            <td class="py-1 pr-2">${escapeAttr(r.pla_id)}</td>
+                            <td class="py-1 pr-2">${escapeAttr(r.ptci)}</td>
+                            <td class="text-right py-1">${escapeAttr(String(r.mean_minutes))}</td>
+                            <td class="text-right py-1">${escapeAttr(String(r.outage_rows))}</td></tr>`
+                    )
+                    .join('');
+                parts.push(
+                    `<div>
+                        <h3 class="font-semibold text-slate-800 mb-2">Highest mean MTTR (by site)</h3>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-xs border-collapse">
+                                <thead><tr class="border-b border-slate-200">
+                                    <th class="text-left py-1">Site</th><th class="text-left">PLA</th><th class="text-left">PTCI</th>
+                                    <th class="text-right">Mean mins</th><th class="text-right">Outage rows</th>
+                                </tr></thead>
+                                <tbody>${rows}</tbody>
+                            </table>
+                        </div>
+                    </div>`
+                );
+            }
+            return parts.join('');
+        }
+
+        async function openInsightModal(td) {
+            insightFocusBefore = document.activeElement;
+            insightModal.classList.remove('hidden');
+            insightLoading.classList.remove('hidden');
+            insightContent.classList.add('hidden');
+            insightContent.innerHTML = '';
+            insightDismiss.focus();
+
+            const params = new URLSearchParams({
+                rowKind: td.dataset.rowKind,
+                region: td.dataset.region,
+                metric: td.dataset.metric,
+                period: td.dataset.period
+            });
+            if (td.dataset.zoo) {
+                params.set('zoo', td.dataset.zoo);
+            }
+
+            try {
+                const res = await fetch(`/api/cell-insight?${params.toString()}`);
+                const raw = await res.json();
+                if (!res.ok) {
+                    insightContent.innerHTML = renderInsightHtml({ error: raw.error || res.statusText });
+                } else {
+                    insightContent.innerHTML = renderInsightHtml(raw);
+                }
+            } catch (err) {
+                insightContent.innerHTML = renderInsightHtml({
+                    error: err && err.message ? err.message : 'Request failed'
+                });
+            } finally {
+                insightLoading.classList.add('hidden');
+                insightContent.classList.remove('hidden');
+            }
+        }
+
+        function handleInsightClick(event) {
+            const td = event.target.closest('td[data-insight]');
+            if (!td) {
+                return;
+            }
+            event.preventDefault();
+            openInsightModal(td);
+        }
+
+        function noDataLayout(message) {
+            return {
+                margin: { t: 5, r: 5, b: 5, l: 5 },
+                showlegend: false,
+                xaxis: { visible: false },
+                yaxis: { visible: false },
+                plot_bgcolor: 'white',
+                paper_bgcolor: 'white',
+                annotations: [
+                    {
+                        text: message,
+                        showarrow: false,
+                        font: { size: 11, color: '#64748b' },
+                        x: 0.5,
+                        y: 0.5,
+                        xref: 'paper',
+                        yref: 'paper',
+                        align: 'center'
+                    }
+                ]
+            };
+        }
+
+        function textColorForHexBackground(hex) {
+            const normalized = String(hex || '').trim();
+            const match = /^#?([0-9a-fA-F]{6})$/.exec(normalized);
+            if (!match) {
+                return '#0f172a';
+            }
+            const h = match[1];
+            const r = parseInt(h.slice(0, 2), 16) / 255;
+            const g = parseInt(h.slice(2, 4), 16) / 255;
+            const b = parseInt(h.slice(4, 6), 16) / 255;
+            const L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            return L > 0.55 ? '#0f172a' : '#ffffff';
+        }
+
+        function renderChart(chartId, chartType, chartData, rowName) {
+            if (!chartData.available) {
+                Plotly.newPlot(chartId, [], noDataLayout(chartData.reason), {
+                    displayModeBar: false,
+                    responsive: true
+                });
+                return;
+            }
+
+            const chartAnnotations = [];
+
+            const traces = [
+                {
+                    x: chartData.months,
+                    y: chartData.actual,
+                    type: 'bar',
+                    marker: { color: chartType.color1 },
+                    texttemplate: chartType.isPercent ? '%{y:.2f}%' : '%{y:,.0f}',
+                    textposition: 'outside',
+                    cliponaxis: false,
+                    textfont: { size: 10, color: '#1e293b' },
+                    hovertemplate: chartType.isPercent
+                        ? '<b>%{x}</b><br>Actual: %{y:.2f}%<extra></extra>'
+                        : '<b>%{x}</b><br>Actual: %{y:,.0f}<extra></extra>'
+                }
+            ];
+
+            if (chartData.target.some((value) => value !== null && value !== undefined)) {
+                traces.push({
+                    x: chartData.months,
+                    y: chartData.target,
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    line: { color: chartType.color2, width: 2 },
+                    marker: { size: 4 },
+                    connectgaps: false,
+                    hovertemplate: chartType.isPercent
+                        ? '<b>%{x}</b><br>Target: %{y:.2f}%<extra></extra>'
+                        : '<b>%{x}</b><br>Target: %{y:,.2f}<extra></extra>'
+                });
+
+                let labelIdx = 0;
+                while (labelIdx < chartData.target.length) {
+                    const v = chartData.target[labelIdx];
+                    if (v !== null && v !== undefined && !Number.isNaN(Number(v))) {
+                        break;
+                    }
+                    labelIdx += 1;
+                }
+                if (labelIdx >= chartData.target.length) {
+                    labelIdx = -1;
+                }
+                if (labelIdx >= 0) {
+                    const ty = Number(chartData.target[labelIdx]);
+                    let labelText;
+                    if (chartType.isPercent) {
+                        labelText = `${ty.toFixed(2)}%`;
+                    } else {
+                        const whole = Math.abs(ty - Math.round(ty)) < 1e-6;
+                        labelText = whole
+                            ? ty.toLocaleString('en-US', { maximumFractionDigits: 0 })
+                            : ty.toLocaleString('en-US', {
+                                  minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2
+                              });
+                    }
+                    const badgeBg = chartType.color2;
+                    chartAnnotations.push({
+                        x: chartData.months[labelIdx],
+                        y: ty,
+                        text: labelText,
+                        xref: 'x',
+                        yref: 'y',
+                        showarrow: false,
+                        xanchor: 'center',
+                        yanchor: 'top',
+                        yshift: -6,
+                        bgcolor: badgeBg,
+                        bordercolor: 'rgba(15, 23, 42, 0.2)',
+                        borderpad: 4,
+                        font: { size: 10, color: textColorForHexBackground(badgeBg) }
+                    });
+                }
+            }
+
+            let yAxisConfig = {
+                automargin: true,
+                tickfont: { size: 8 },
+                showgrid: true,
+                gridcolor: '#f1f5f9'
+            };
+
+            if (chartType.id === 'availability') {
+                const availabilityValues = [...chartData.actual, ...chartData.target]
+                    .filter((value) => value !== null && value !== undefined && !Number.isNaN(value));
+                if (availabilityValues.length > 0) {
+                    const minValue = Math.min(...availabilityValues);
+                    const lowerBound = Math.max(99.85, Math.floor((minValue - 0.02) * 100) / 100);
+                    yAxisConfig = {
+                        ...yAxisConfig,
+                        range: [lowerBound, 100],
+                        tickformat: '.2f'
+                    };
+                }
+            }
+
+            const layout = {
+                margin: { t: 42, r: 10, b: 52, l: 32 },
+                showlegend: false,
+                barmode: 'group',
+                xaxis: {
+                    automargin: true,
+                    tickfont: { size: 9 },
+                    tickangle: -35,
+                    showgrid: false
+                },
+                yaxis: yAxisConfig,
+                plot_bgcolor: 'white',
+                paper_bgcolor: 'white',
+                annotations: chartAnnotations
+            };
+
+            Plotly.newPlot(chartId, traces, layout, {
+                displayModeBar: false,
+                responsive: true
+            });
+        }
+
+        function appendChartRow(parent, rowName, rowIndex, chartSource) {
+            const chartsByRow = chartSource || dashboardData.charts;
+            const rowBundle = chartsByRow[rowName];
+            const rowDiv = document.createElement('div');
+            rowDiv.className = 'flex flex-row items-center gap-4 border-b border-slate-200 pb-4 mb-4';
+
+            const titleDiv = document.createElement('div');
+            titleDiv.className = 'w-32 font-bold text-sm text-slate-800 flex-shrink-0';
+            titleDiv.innerHTML = `${rowName}<br>Performance`;
+            rowDiv.appendChild(titleDiv);
+
+            const chartsContainer = document.createElement('div');
+            chartsContainer.className = 'flex-1 grid grid-cols-5 gap-2';
+
+            chartTypes.forEach((chartType, colIndex) => {
+                const chartId = `chart-${rowIndex}-${colIndex}`;
+                const chartWrapper = document.createElement('div');
+                chartWrapper.className = 'bg-white p-2 border border-slate-200 rounded';
+
+                const titleEl = document.createElement('div');
+                titleEl.className = 'text-center text-[10px] font-semibold mb-2 whitespace-pre-line text-slate-600 h-8';
+                titleEl.innerText = chartType.title;
+                chartWrapper.appendChild(titleEl);
+
+                const chartDiv = document.createElement('div');
+                chartDiv.id = chartId;
+                chartDiv.className = 'h-[200px] w-full';
+                chartWrapper.appendChild(chartDiv);
+
+                chartsContainer.appendChild(chartWrapper);
+                setTimeout(() => {
+                    renderChart(chartId, chartType, rowBundle[chartType.id], rowName);
+                }, 0);
+            });
+
+            rowDiv.appendChild(chartsContainer);
+            parent.appendChild(rowDiv);
+        }
+
+        function renderCharts() {
+            const chartsSection = document.getElementById('charts-section');
+            chartsSection.innerHTML = '';
+
+            appendChartRow(chartsSection, 'Overall', 0);
+
+            const regionalDetails = document.createElement('details');
+            regionalDetails.className = 'regional-charts w-full';
+            regionalDetails.open = true;
+
+            const summary = document.createElement('summary');
+            summary.className = 'regional-charts-summary';
+            summary.textContent = 'Regional Performance';
+            regionalDetails.appendChild(summary);
+
+            const inner = document.createElement('div');
+            inner.className = 'regional-charts-inner';
+            chartRowOrderRegional.forEach((rowName, i) => {
+                appendChartRow(inner, rowName, i + 1);
+            });
+            regionalDetails.appendChild(inner);
+            chartsSection.appendChild(regionalDetails);
+
+            const territoryOrder = dashboardData.territoryOrder || [];
+            if (territoryOrder.length) {
+                const territoryDetails = document.createElement('details');
+                territoryDetails.className = 'regional-charts w-full';
+                territoryDetails.open = true;
+
+                const territorySummary = document.createElement('summary');
+                territorySummary.className = 'regional-charts-summary';
+                territorySummary.textContent = 'Teritory Performance';
+                territoryDetails.appendChild(territorySummary);
+
+                const territoryInner = document.createElement('div');
+                territoryInner.className = 'regional-charts-inner';
+                const territoryCharts = dashboardData.territoryCharts || {};
+                territoryOrder.forEach((rowName, i) => {
+                    appendChartRow(territoryInner, rowName, 100 + i, territoryCharts);
+                });
+                territoryDetails.appendChild(territoryInner);
+                chartsSection.appendChild(territoryDetails);
+            }
+        }
+
+        renderTableHead();
+        renderMeta();
+        renderTable();
+        renderCharts();
+        document.getElementById('table-body').addEventListener('click', handleTableToggle);
+        document.getElementById('data-table-section').addEventListener('click', handleInsightClick);
+        insightDismiss.addEventListener('click', closeInsightModal);
+        insightBackdrop.addEventListener('click', closeInsightModal);
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && !insightModal.classList.contains('hidden')) {
+                closeInsightModal();
+            }
+        });
+    </script>
+</body>
+</html>
