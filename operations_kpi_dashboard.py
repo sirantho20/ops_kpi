@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
-import sys
 import threading
 from functools import lru_cache
 from http import HTTPStatus
@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
+import psycopg
 
 from operations_kpi_data import (
     OpsKpiTargets,
@@ -33,6 +34,23 @@ DATA_PLACEHOLDER = "__DASHBOARD_DATA__"
 
 _analysis_cache: dict[str, tuple[str, object, dict, OpsKpiTargets]] = {}
 _analysis_lock = threading.Lock()
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_analysis_context(
@@ -58,6 +76,11 @@ def get_analysis_context(
 
 def parse_args() -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
+    env_default_host = os.environ.get("OPERATIONS_KPI_HOST", DEFAULT_HOST)
+    env_default_port = _env_int(
+        "OPERATIONS_KPI_PORT",
+        _env_int("PORT", DEFAULT_PORT),
+    )
     parser = argparse.ArgumentParser(
         description="Serve the Operations KPI dashboard (PostgreSQL only)."
     )
@@ -68,14 +91,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--host",
-        default=DEFAULT_HOST,
+        default=env_default_host,
         help="Host interface to bind.",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_PORT,
+        default=env_default_port,
         help="TCP port to bind.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("OPERATIONS_KPI_LOG_LEVEL", "INFO"),
+        help="Python logging level (DEBUG, INFO, WARNING, ERROR).",
+    )
+    parser.add_argument(
+        "--debug-errors",
+        action="store_true",
+        default=_env_flag("OPERATIONS_KPI_DEBUG_ERRORS", default=False),
+        help="Expose internal error details in HTTP responses.",
     )
     return parser.parse_args()
 
@@ -85,6 +119,8 @@ def make_handler(
     *,
     database_url: str,
     targets_database_url: str | None,
+    debug_errors: bool,
+    logger: logging.Logger,
 ):
     @lru_cache(maxsize=32)
     def rendered_html(data_fp: str, template_path_str: str, template_mtime: float) -> str:
@@ -103,13 +139,49 @@ def make_handler(
         )
 
     class DashboardHandler(BaseHTTPRequestHandler):
-        def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
+        def _error_message(self, exc: Exception, *, fallback: str) -> str:
+            return str(exc) if debug_errors else fallback
+
+        def _send_json(
+            self,
+            payload: dict,
+            status: HTTPStatus = HTTPStatus.OK,
+            *,
+            send_body: bool = True,
+        ) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if send_body:
+                self.wfile.write(body)
+
+        def _serve_healthz(self, send_body: bool = True) -> None:
+            body = b'{"status":"ok"}'
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(body)
+
+        def _serve_readyz(self, send_body: bool = True) -> None:
+            try:
+                with psycopg.connect(database_url, connect_timeout=3) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                payload = {"status": "ready"}
+                status = HTTPStatus.OK
+            except Exception as exc:  # pragma: no cover - network/database dependent
+                logger.exception("Readiness check failed")
+                payload = {
+                    "status": "not_ready",
+                    "error": self._error_message(exc, fallback="Database unavailable"),
+                }
+                status = HTTPStatus.SERVICE_UNAVAILABLE
+            self._send_json(payload, status=status, send_body=send_body)
 
         def _serve_cell_insight(self) -> None:
             parsed = urlparse(self.path)
@@ -157,8 +229,14 @@ def make_handler(
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             except Exception as exc:  # pragma: no cover
+                logger.exception("Unexpected cell insight failure")
                 self._send_json(
-                    {"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR
+                    {
+                        "error": self._error_message(
+                            exc, fallback="Internal server error"
+                        )
+                    },
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
         def _serve_dashboard(self, send_body: bool) -> None:
@@ -169,12 +247,17 @@ def make_handler(
                     data_fp, str(template_path.resolve()), st.st_mtime
                 )
             except Exception as exc:  # pragma: no cover - surfaced in browser and console
+                logger.exception("Failed to render dashboard")
                 self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
                 if send_body:
-                    self.wfile.write(f"Dashboard failed to load:\n{exc}".encode("utf-8"))
-                raise
+                    message = self._error_message(
+                        exc,
+                        fallback="Dashboard failed to load.",
+                    )
+                    self.wfile.write(message.encode("utf-8"))
+                return
 
             body = html.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -186,6 +269,12 @@ def make_handler(
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/healthz":
+                self._serve_healthz(send_body=True)
+                return
+            if parsed.path == "/readyz":
+                self._serve_readyz(send_body=True)
+                return
             if parsed.path == "/api/cell-insight":
                 self._serve_cell_insight()
                 return
@@ -196,6 +285,12 @@ def make_handler(
 
         def do_HEAD(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/healthz":
+                self._serve_healthz(send_body=False)
+                return
+            if parsed.path == "/readyz":
+                self._serve_readyz(send_body=False)
+                return
             if parsed.path == "/api/cell-insight":
                 self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
                 self.end_headers()
@@ -206,18 +301,22 @@ def make_handler(
             self._serve_dashboard(send_body=False)
 
         def log_message(self, format: str, *args) -> None:
-            print(f"{self.address_string()} - {format % args}")
+            logger.info("%s - %s", self.address_string(), format % args)
 
     return DashboardHandler
 
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+    logger = logging.getLogger("operations_kpi_dashboard")
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
-        print(
+        logger.error(
             "DATABASE_URL is not set. Add it to .env or the environment (PostgreSQL connection string).",
-            file=sys.stderr,
         )
         raise SystemExit(1)
     targets_database_url = database_url
@@ -230,16 +329,18 @@ def main() -> None:
         template_path,
         database_url=database_url,
         targets_database_url=targets_database_url,
+        debug_errors=args.debug_errors,
+        logger=logger,
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
 
-    print(f"Serving Operations KPI dashboard at http://{args.host}:{args.port}")
-    print("Data source: PostgreSQL (DATABASE_URL)")
-    print(f"HTML template: {template_path}")
+    logger.info("Serving Operations KPI dashboard at http://%s:%s", args.host, args.port)
+    logger.info("Data source: PostgreSQL (DATABASE_URL)")
+    logger.info("HTML template: %s", template_path)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down dashboard server.")
+        logger.info("Shutting down dashboard server.")
     finally:
         server.server_close()
 
