@@ -18,8 +18,15 @@ COPY ["operations_kpi_dashboard.py", "operations_kpi_data.py", "operations_kpi_i
 EXPOSE 8054
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import sys, urllib.request; urllib.request.urlopen('http://127.0.0.1:8054/healthz', timeout=3); sys.exit(0)"
+  CMD python -c "import os, sys, urllib.request; port = os.environ.get('OPERATIONS_KPI_PORT', '8054'); urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3); sys.exit(0)"
 
 USER app
 
-CMD ["python", "operations_kpi_dashboard.py"]
+# Force bind to all interfaces inside the container so published ports work from
+# every host address (LAN, VPN, etc.). Overrides OPERATIONS_KPI_HOST from .env.
+#
+# Production run (survive crashes and host reboot; omit restart if you want manual-only).
+# Publish on all host addresses (LAN, VPN, etc.): IPv4 0.0.0.0 and IPv6 [::].
+#   docker run -d --name operations-kpi-dashboard --restart unless-stopped \
+#     -p 0.0.0.0:18054:8054 -p [::]:18054:8054 --env-file .env operations-kpi-dashboard:prod
+CMD ["python", "operations_kpi_dashboard.py", "--host", "0.0.0.0"]

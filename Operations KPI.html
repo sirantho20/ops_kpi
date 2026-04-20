@@ -297,7 +297,7 @@
         const metricConfigs = [
             {
                 id: 'events',
-                title: 'EVENTS',
+                title: 'OUTAGES',
                 groupClass: 'bg-blue-500 text-white',
                 subHeaderClass: 'bg-mtd font-semibold',
                 targetLabel: 'Target (less 15%)'
@@ -337,7 +337,7 @@
         const chartRowOrderRegional = chartRowOrder.filter((r) => r !== 'Overall');
         const collapsedRegions = new Set();
         const chartTypes = [
-            { id: 'events', title: 'Events\n(< 15%)', color1: '#3b82f6', color2: '#fb923c', isPercent: false },
+            { id: 'events', title: 'Outages\n(< 15%)', color1: '#3b82f6', color2: '#fb923c', isPercent: false },
             { id: 'mttr', title: 'MTTR Performance\n(3 Hours)', color1: '#FFA500', color2: '#22c55e', isPercent: false },
             { id: 'availability', title: 'Availability Performance\n(99.96%)', color1: '#008000', color2: '#3b82f6', isPercent: true },
             { id: 'cm', title: 'CM Count\n(<15%)', color1: '#800080', color2: '#eab308', isPercent: false },

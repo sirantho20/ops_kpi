@@ -9,9 +9,9 @@ from operations_kpi_data import (
     OpsKpiTargets,
     aggregate_availability_pct,
     aggregate_cm_count,
-    aggregate_event_count,
-    aggregate_mttr_minutes,
-    aggregate_visit_count,
+    aggregate_event_count_table,
+    aggregate_mttr_minutes_table,
+    aggregate_visit_count_table,
     fiscal_year_labels,
     format_value,
     scope_frame,
@@ -86,9 +86,9 @@ def _row_targets(
 ) -> dict[str, float | int | None]:
     previous_fy_label = fiscal_year_labels(periods)[0]
     mask = periods[previous_fy_label]
-    baseline_events = aggregate_event_count(scoped_df.loc[mask])
+    baseline_events = aggregate_event_count_table(scoped_df.loc[mask])
     baseline_cm = aggregate_cm_count(scoped_df.loc[mask])
-    baseline_visit = aggregate_visit_count(scoped_df.loc[mask])
+    baseline_visit = aggregate_visit_count_table(scoped_df.loc[mask])
     return {
         "events": (
             baseline_events * ops_targets.events_baseline_factor
@@ -124,7 +124,7 @@ def _target_explanation(
 
     if metric == "events":
         bf = ops_targets.events_baseline_factor
-        b = aggregate_event_count(scoped_df.loc[prev_mask])
+        b = aggregate_event_count_table(scoped_df.loc[prev_mask])
         t = targets["events"]
         return (
             f"Target is {bf:.0%} of {prev_fy} total incidents. "
@@ -140,7 +140,7 @@ def _target_explanation(
         )
     if metric == "visit":
         bf = ops_targets.visit_baseline_factor
-        b = aggregate_visit_count(scoped_df.loc[prev_mask])
+        b = aggregate_visit_count_table(scoped_df.loc[prev_mask])
         t = targets["visit"]
         return (
             f"Target is {bf:.0%} of {prev_fy} visit count. "
@@ -263,16 +263,16 @@ def compute_cell_insight(
     period_df = scoped.loc[period_mask].copy()
 
     if metric == "events":
-        actual = aggregate_event_count(period_df)
+        actual = aggregate_event_count_table(period_df)
         target = targets["events"]
     elif metric == "cm":
         actual = aggregate_cm_count(period_df)
         target = targets["cm"]
     elif metric == "visit":
-        actual = aggregate_visit_count(period_df)
+        actual = aggregate_visit_count_table(period_df)
         target = targets["visit"]
     elif metric == "mttr":
-        actual = aggregate_mttr_minutes(period_df)
+        actual = aggregate_mttr_minutes_table(period_df)
         target = targets["mttr"]
     else:
         actual = aggregate_availability_pct(period_df)

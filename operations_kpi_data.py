@@ -58,9 +58,33 @@ def load_ops_kpi_targets(database_url: str | None) -> OpsKpiTargets:
         availability_pct=float(ap),
     )
 
-OPS_KPI_LOAD_SQL = """
+def _pg_column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1
+        """,
+        (table, column),
+    )
+    return cur.fetchone() is not None
+
+
+def _ops_kpi_load_sql(*, has_ops_kpi_cm_count: bool) -> str:
+    """Build site×date load SQL; CM inner metric uses ``cm_count`` column when present else row count."""
+    cm_inner = (
+        "COALESCE(e.cm_count, 0)::integer AS cm_row_value"
+        if has_ops_kpi_cm_count
+        else "1::integer AS cm_row_value"
+    )
+    return f"""
 -- Site-first dataset: every site across the dashboard date axis, with blank metrics when no
 -- matching availability fact row exists for (kpi_site_id, date).
+-- Date axis includes any calendar day present in availability, CM, or site visits so FY table
+-- totals include full-year facts even when charts clip the x-axis (see CHART_MONTH_START).
 WITH site_dim AS (
     SELECT
         s.site_id::text AS site_table_site_id,
@@ -74,17 +98,24 @@ WITH site_dim AS (
     FROM site s
 ),
 date_dim AS (
-    SELECT DISTINCT a.date::date AS date
-    FROM ops_kpi_availability a
+    SELECT DISTINCT u.dt::date AS date
+    FROM (
+        SELECT a.date::date AS dt FROM ops_kpi_availability a
+        UNION
+        SELECT e.event_date::date AS dt FROM ops_kpi_cm e WHERE e.event_date IS NOT NULL
+        UNION
+        SELECT v.date::date AS dt FROM ops_kpi_sitevisit v
+    ) u
 ),
 cm_counts AS (
     SELECT
         kpi_site_id AS site_id,
         event_date AS date,
-        COUNT(*)::integer AS cm_count
+        SUM(cm_row_value)::integer AS cm_count
     FROM (
         SELECT
             e.event_date,
+            {cm_inner},
             COALESCE(
                 NULLIF(BTRIM(s.pla_id), ''),
                 s.site_id,
@@ -231,7 +262,8 @@ def load_dashboard_payload(
 def load_daily_availability_from_database(database_url: str) -> pd.DataFrame:
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
-            cur.execute(OPS_KPI_LOAD_SQL)
+            has_cm = _pg_column_exists(cur, "ops_kpi_cm", "cm_count")
+            cur.execute(_ops_kpi_load_sql(has_ops_kpi_cm_count=has_cm))
             rows = cur.fetchall()
             desc = cur.description
             columns = [
@@ -248,6 +280,7 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*)::bigint, MAX(date) FROM ops_kpi_availability")
             count, max_date = cur.fetchone()
+            cm_col = "1" if _pg_column_exists(cur, "ops_kpi_cm", "cm_count") else "0"
             tgt_sig = ""
             try:
                 cur.execute(
@@ -269,7 +302,7 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
             except Exception:
                 pass
     max_s = max_date.isoformat() if max_date is not None else ""
-    return f"{count}|{max_s}|{tgt_sig}|{cm_sig}"
+    return f"{count}|{max_s}|{tgt_sig}|{cm_sig}|cc={cm_col}"
 
 
 def ops_kpi_targets_revision(database_url: str) -> str:
@@ -578,7 +611,7 @@ def build_table_row(
     group_end: bool = False,
 ) -> dict:
     previous_fy_label = fiscal_year_labels(periods)[0]
-    baseline_events = aggregate_event_count(scoped_df.loc[periods[previous_fy_label]])
+    baseline_events = aggregate_event_count_table(scoped_df.loc[periods[previous_fy_label]])
     event_target = (
         baseline_events * targets.events_baseline_factor
         if baseline_events is not None
@@ -588,7 +621,7 @@ def build_table_row(
     cm_target = (
         baseline_cm * targets.cm_baseline_factor if baseline_cm is not None else None
     )
-    baseline_visit = aggregate_visit_count(scoped_df.loc[periods[previous_fy_label]])
+    baseline_visit = aggregate_visit_count_table(scoped_df.loc[periods[previous_fy_label]])
     visit_target = (
         baseline_visit * targets.visit_baseline_factor
         if baseline_visit is not None
@@ -610,13 +643,13 @@ def build_table_row(
         "groupEnd": group_end,
         "siteCount": build_number_cell(count_unique_sites(scoped_df)),
         "events": build_metric_group(
-            actuals=build_period_actuals(scoped_df, periods, aggregate_event_count),
+            actuals=build_period_actuals(scoped_df, periods, aggregate_event_count_table),
             target=event_target,
             kind="number",
             compare_mode="upper_is_bad",
         ),
         "mttr": build_metric_group(
-            actuals=build_period_actuals(scoped_df, periods, aggregate_mttr_minutes),
+            actuals=build_period_actuals(scoped_df, periods, aggregate_mttr_minutes_table),
             target=targets.mttr_minutes,
             kind="number",
             compare_mode="upper_is_bad",
@@ -634,7 +667,7 @@ def build_table_row(
             compare_mode="upper_is_bad",
         ),
         "visit": build_metric_group(
-            actuals=build_period_actuals(scoped_df, periods, aggregate_visit_count),
+            actuals=build_period_actuals(scoped_df, periods, aggregate_visit_count_table),
             target=visit_target,
             kind="number",
             compare_mode="upper_is_bad",
@@ -719,7 +752,7 @@ def format_value(value: float | int | None, kind: str = "number") -> str:
 def count_unique_sites(df: pd.DataFrame) -> int | None:
     """Distinct ``site.site_id`` from the joined ``Site`` table (``site_table_site_id``).
 
-    When loading from PostgreSQL, ``OPS_KPI_LOAD_SQL`` supplies ``site_table_site_id`` via
+    When loading from PostgreSQL, the site×date load query supplies ``site_table_site_id`` via
     ``public.site`` (same KPI-key mapping as CM events). Same row scope as other metrics:
     ``Region`` in ``REGION_ORDER``, ``Zoo != UNMAPPED_ZOO``, ``scope_frame`` for region rows.
 
@@ -754,10 +787,15 @@ def aggregate_event_count(df: pd.DataFrame) -> int | None:
 
 
 def aggregate_cm_count(df: pd.DataFrame) -> int | None:
-    fact_df = _fact_rows_only(df)
-    if fact_df.empty:
+    """Sum CM across every site×date row in ``df`` (same cells as the PostgreSQL load query).
+
+    CM is intentionally **not** filtered with ``_fact_rows_only``: a CM on a day without an
+    ``ops_kpi_availability`` row still contributes, matching ``ops_kpi_cm`` (+ site KPI key)
+    rather than tying CM to availability coverage.
+    """
+    if df.empty:
         return None
-    return int(fact_df["CM Count"].fillna(0).sum())
+    return int(df["CM Count"].fillna(0).sum())
 
 
 def aggregate_visit_count(df: pd.DataFrame) -> int | None:
@@ -765,6 +803,22 @@ def aggregate_visit_count(df: pd.DataFrame) -> int | None:
     if fact_df.empty:
         return None
     return int(fact_df["Visit Count"].fillna(0).sum())
+
+
+def aggregate_event_count_table(df: pd.DataFrame) -> int | None:
+    """Table totals: sum incidents on every site×date row (not restricted to availability facts)."""
+
+    if df.empty:
+        return None
+    return int(df["Incident_count"].fillna(0).sum())
+
+
+def aggregate_visit_count_table(df: pd.DataFrame) -> int | None:
+    """Table totals: sum visits on every site×date row (not restricted to availability facts)."""
+
+    if df.empty:
+        return None
+    return int(df["Visit Count"].fillna(0).sum())
 
 
 def aggregate_mttr_minutes(df: pd.DataFrame) -> float | None:
@@ -778,6 +832,23 @@ def aggregate_mttr_minutes(df: pd.DataFrame) -> float | None:
     if values.empty:
         return None
     return float(values.mean())
+
+
+def aggregate_mttr_minutes_table(df: pd.DataFrame) -> float:
+    """Mean accepted outage minutes for rows with positive outages; table shows ``0`` when undefined."""
+
+    fact_df = _fact_rows_only(df)
+    if fact_df.empty:
+        return 0.0
+
+    values = fact_df.loc[
+        fact_df["Accepted Outage Minutes"] > 0, "Accepted Outage Minutes"
+    ].dropna()
+    if values.empty:
+        return 0.0
+
+    m = float(values.mean())
+    return m if math.isfinite(m) else 0.0
 
 
 def aggregate_availability_pct(df: pd.DataFrame) -> float | None:

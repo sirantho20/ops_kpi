@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import threading
+import time
+import urllib.request
 from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -111,6 +113,13 @@ def parse_args() -> argparse.Namespace:
         default=_env_flag("OPERATIONS_KPI_DEBUG_ERRORS", default=False),
         help="Expose internal error details in HTTP responses.",
     )
+    parser.add_argument(
+        "--no-prewarm",
+        dest="prewarm",
+        action="store_false",
+        help="Disable background warm-up of the / page (first browser request can take many minutes).",
+    )
+    parser.set_defaults(prewarm=_env_flag("OPERATIONS_KPI_PREWARM", default=True))
     return parser.parse_args()
 
 
@@ -306,6 +315,28 @@ def make_handler(
     return DashboardHandler
 
 
+def _prewarm_dashboard_cache(*, logger: logging.Logger, port: int) -> None:
+    """Request / on loopback so the heavy DB render runs once and lru_cache stays hot."""
+    time.sleep(0.35)
+    deadline_s = float(os.environ.get("OPERATIONS_KPI_PREWARM_TIMEOUT", "900"))
+    url = f"http://127.0.0.1:{port}/"
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(url, timeout=deadline_s) as resp:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+        logger.info(
+            "Dashboard pre-warm finished in %.1fs; / should respond quickly for browsers now.",
+            time.perf_counter() - t0,
+        )
+    except Exception:
+        logger.exception(
+            "Dashboard pre-warm failed; the first / request may take a long time.",
+        )
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -333,16 +364,34 @@ def main() -> None:
         logger=logger,
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
+    serve_thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+        name="operations-kpi-http",
+    )
+    serve_thread.start()
 
     logger.info("Serving Operations KPI dashboard at http://%s:%s", args.host, args.port)
     logger.info("Data source: PostgreSQL (DATABASE_URL)")
     logger.info("HTML template: %s", template_path)
+    if args.prewarm:
+        logger.info(
+            "Pre-warming dashboard in the background (avoids a multi-minute blank wait on first / in the browser).",
+        )
+        threading.Thread(
+            target=_prewarm_dashboard_cache,
+            kwargs={"logger": logger, "port": args.port},
+            daemon=True,
+            name="operations-kpi-prewarm",
+        ).start()
     try:
-        server.serve_forever()
+        serve_thread.join()
     except KeyboardInterrupt:
         logger.info("Shutting down dashboard server.")
     finally:
+        server.shutdown()
         server.server_close()
+        serve_thread.join(timeout=15)
 
 
 if __name__ == "__main__":
