@@ -4,16 +4,20 @@ import math
 from typing import Any
 
 import pandas as pd
+import psycopg
 
 from operations_kpi_data import (
     OpsKpiTargets,
     aggregate_availability_pct,
+    availability_pct_for_region_scope,
     aggregate_cm_count,
     aggregate_event_count_table,
     aggregate_mttr_minutes_table,
     aggregate_visit_count_table,
+    fetch_ops_kpi_metrics_for_date_range,
     fiscal_year_labels,
     format_value,
+    period_date_range_for_insight,
     scope_frame,
 )
 
@@ -83,12 +87,19 @@ def _row_targets(
     scoped_df: pd.DataFrame,
     periods: dict[str, pd.Series],
     ops_targets: OpsKpiTargets,
+    *,
+    row_kind: str,
+    region: str | None,
 ) -> dict[str, float | int | None]:
     previous_fy_label = fiscal_year_labels(periods)[0]
     mask = periods[previous_fy_label]
     baseline_events = aggregate_event_count_table(scoped_df.loc[mask])
     baseline_cm = aggregate_cm_count(scoped_df.loc[mask])
     baseline_visit = aggregate_visit_count_table(scoped_df.loc[mask])
+    if row_kind == "footer":
+        availability_target = ops_targets.availability_pct
+    else:
+        availability_target = availability_pct_for_region_scope(region or "Overall", ops_targets)
     return {
         "events": (
             baseline_events * ops_targets.events_baseline_factor
@@ -96,7 +107,7 @@ def _row_targets(
             else None
         ),
         "mttr": ops_targets.mttr_minutes,
-        "availability": ops_targets.availability_pct,
+        "availability": availability_target,
         "cm": (
             baseline_cm * ops_targets.cm_baseline_factor
             if baseline_cm is not None
@@ -152,8 +163,10 @@ def _target_explanation(
             "within the scoped rows."
         )
     if metric == "availability":
+        t = targets["availability"]
+        pct = float(t) if t is not None else ops_targets.availability_pct
         return (
-            f"Target is weighted availability at or above {ops_targets.availability_pct:.2f}% "
+            f"Target is weighted availability at or above {pct:.2f}% "
             "(same weighting as the main table: minutes-weighted ratio, with uptime fallback)."
         )
     return ""
@@ -223,6 +236,8 @@ def compute_cell_insight(
     metric: str,
     period_key: str,
     ops_targets: OpsKpiTargets,
+    *,
+    database_url: str | None = None,
 ) -> dict[str, Any]:
     if metric not in METRICS:
         raise ValueError(f"Invalid metric: {metric}")
@@ -230,7 +245,9 @@ def compute_cell_insight(
         raise ValueError(f"Invalid period: {period_key}")
 
     scoped = resolve_scoped_df(df, row_kind, region, zoo)
-    targets = _row_targets(scoped, periods, ops_targets)
+    targets = _row_targets(
+        scoped, periods, ops_targets, row_kind=row_kind, region=region
+    )
     compare_mode = _METRIC_COMPARE[metric]
 
     label_parts = [region or ""]
@@ -262,8 +279,27 @@ def compute_cell_insight(
     period_mask = periods[period_key]
     period_df = scoped.loc[period_mask].copy()
 
+    sql_triple: tuple[int, float | None, float | None] | None = None
+    if database_url and metric in ("events", "mttr", "availability"):
+        d0, d1 = period_date_range_for_insight(df, periods, period_key)
+        if d0 is not None and d1 is not None:
+            with psycopg.connect(database_url) as conn:
+                with conn.cursor() as cur:
+                    sql_triple = fetch_ops_kpi_metrics_for_date_range(
+                        cur,
+                        d0,
+                        d1,
+                        row_kind=row_kind,
+                        region=region if row_kind in ("region", "zoo") else None,
+                        zoo=zoo if row_kind == "zoo" else None,
+                    )
+
     if metric == "events":
-        actual = aggregate_event_count_table(period_df)
+        actual = (
+            sql_triple[0]
+            if sql_triple is not None
+            else aggregate_event_count_table(period_df)
+        )
         target = targets["events"]
     elif metric == "cm":
         actual = aggregate_cm_count(period_df)
@@ -272,10 +308,18 @@ def compute_cell_insight(
         actual = aggregate_visit_count_table(period_df)
         target = targets["visit"]
     elif metric == "mttr":
-        actual = aggregate_mttr_minutes_table(period_df)
+        actual = (
+            sql_triple[1]
+            if sql_triple is not None
+            else aggregate_mttr_minutes_table(period_df)
+        )
         target = targets["mttr"]
     else:
-        actual = aggregate_availability_pct(period_df)
+        actual = (
+            sql_triple[2]
+            if sql_triple is not None
+            else aggregate_availability_pct(period_df)
+        )
         target = targets["availability"]
 
     meets = _meets_target(actual, target, compare_mode)

@@ -6,7 +6,8 @@ INSERT INTO ops_kpi_targets (metric_key, value) VALUES
     ('cm_baseline_factor', 0.85),
     ('visit_baseline_factor', 0.85),
     ('mttr_minutes', 200),
-    ('availability_pct', 99.96)
+    ('availability_pct', 99.96),
+    ('availability_pct_ncr', 99.98)
 ON CONFLICT (metric_key) DO UPDATE SET
     value = EXCLUDED.value,
     updated_at = now();

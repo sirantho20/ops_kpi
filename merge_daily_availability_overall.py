@@ -171,9 +171,21 @@ def load_dispatch_metrics(
     return grouped
 
 
+def _first_non_null_series(s: pd.Series) -> object:
+    v = s.dropna()
+    if v.empty:
+        return np.nan
+    return v.iloc[0]
+
+
 def merge_dispatch_metrics(
     availability_df: pd.DataFrame, dispatch_path: str | Path
 ) -> pd.DataFrame:
+    """Attach NV/CM from dispatch with an outer join on (PTCI / Site ID, Date).
+
+    Dispatch-only keys are kept so normal visits count at site×date grain without
+    requiring an availability row for that day.
+    """
     merged = availability_df.copy()
     merged["Date"] = pd.to_datetime(merged["Date"], errors="coerce").dt.normalize()
     merged["_dispatch_site_id"] = normalize_identifier_series(merged["PTCI Number"])
@@ -182,13 +194,28 @@ def merge_dispatch_metrics(
         if column in merged.columns:
             merged = merged.drop(columns=[column])
 
+    has_ptci = merged["_dispatch_site_id"].notna()
+    attr = (
+        merged.loc[has_ptci, ["_dispatch_site_id", "PLA ID", "Region"]]
+        .groupby("_dispatch_site_id", dropna=False)
+        .agg(_first_non_null_series)
+    )
+    pla_map = attr["PLA ID"].to_dict()
+    region_map = attr["Region"].to_dict()
+
     dispatch = load_dispatch_metrics(dispatch_path)
     merged = merged.merge(
         dispatch,
-        how="left",
+        how="outer",
         left_on=["_dispatch_site_id", "Date"],
         right_on=["Site ID", "Date"],
     )
+    key = merged["_dispatch_site_id"].fillna(merged["Site ID"])
+    merged["PTCI Number"] = normalize_identifier_series(
+        merged["PTCI Number"].fillna(merged["Site ID"])
+    )
+    merged["PLA ID"] = normalize_identifier_series(merged["PLA ID"].fillna(key.map(pla_map)))
+    merged["Region"] = merged["Region"].fillna(key.map(region_map))
     merged = merged.drop(columns=["_dispatch_site_id", "Site ID"])
     merged["Visit Count"] = pd.to_numeric(merged["Visit Count"], errors="coerce").fillna(0).astype(int)
     merged["CM Count"] = pd.to_numeric(merged["CM Count"], errors="coerce").fillna(0).astype(int)

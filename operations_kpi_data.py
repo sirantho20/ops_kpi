@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -21,6 +22,7 @@ class OpsKpiTargets:
     visit_baseline_factor: float
     mttr_minutes: float
     availability_pct: float
+    availability_pct_ncr: float
 
 
 def default_ops_kpi_targets() -> OpsKpiTargets:
@@ -30,6 +32,7 @@ def default_ops_kpi_targets() -> OpsKpiTargets:
         visit_baseline_factor=0.85,
         mttr_minutes=200.0,
         availability_pct=99.96,
+        availability_pct_ncr=99.98,
     )
 
 
@@ -50,13 +53,23 @@ def load_ops_kpi_targets(database_url: str | None) -> OpsKpiTargets:
     vis = rows.get("visit_baseline_factor", legacy if legacy is not None else d.visit_baseline_factor)
     mt = rows.get("mttr_minutes", d.mttr_minutes)
     ap = rows.get("availability_pct", d.availability_pct)
+    ap_ncr = rows.get("availability_pct_ncr", d.availability_pct_ncr)
     return OpsKpiTargets(
         events_baseline_factor=float(ev),
         cm_baseline_factor=float(cm),
         visit_baseline_factor=float(vis),
         mttr_minutes=float(mt),
         availability_pct=float(ap),
+        availability_pct_ncr=float(ap_ncr),
     )
+
+
+def availability_pct_for_region_scope(region: str, targets: OpsKpiTargets) -> float:
+    """Availability TARGET for a dashboard region row or chart scope (Overall, NCR, …)."""
+    if region == "NCR":
+        return targets.availability_pct_ncr
+    return targets.availability_pct
+
 
 def _pg_column_exists(cur, table: str, column: str) -> bool:
     cur.execute(
@@ -84,9 +97,15 @@ def _ops_kpi_load_sql(*, has_ops_kpi_cm_count: bool) -> str:
 -- Site-first dataset: every site across the dashboard date axis, with blank metrics when no
 -- matching availability fact row exists for (kpi_site_id, date).
 -- Date axis includes any calendar day present in availability, CM, or site visits so FY table
--- totals include full-year facts even when charts clip the x-axis (see CHART_MONTH_START).
+-- totals include full-year facts. Charts use a fixed monthly axis from CHART_MONTH_START (Jan 2025)
+-- through the latest month present in loaded data.
 WITH site_dim AS (
-    SELECT
+    SELECT DISTINCT ON (
+        COALESCE(
+            NULLIF(BTRIM(s.pla_id::text), ''),
+            s.site_id::text
+        )
+    )
         s.site_id::text AS site_table_site_id,
         COALESCE(
             NULLIF(BTRIM(s.pla_id::text), ''),
@@ -96,6 +115,12 @@ WITH site_dim AS (
         NULLIF(BTRIM(COALESCE(s.zoo::text, '')), '') AS site_zoo,
         NULLIF(BTRIM(COALESCE(s.teritory::text, '')), '') AS site_teritory
     FROM site s
+    ORDER BY
+        COALESCE(
+            NULLIF(BTRIM(s.pla_id::text), ''),
+            s.site_id::text
+        ),
+        s.site_id::text
 ),
 date_dim AS (
     SELECT DISTINCT u.dt::date AS date
@@ -155,7 +180,7 @@ LEFT JOIN ops_kpi_availability a
     ON a.site_id = sd.kpi_site_id
    AND a.date = d.date
 LEFT JOIN ops_kpi_sitevisit v
-    ON v.site_id = sd.kpi_site_id
+    ON v.site_id = sd.site_table_site_id
    AND v.date = d.date
 LEFT JOIN cm_counts c
     ON c.site_id = sd.kpi_site_id
@@ -186,8 +211,39 @@ CSV_REQUIRED_COLUMNS = {
 }
 
 REGION_ORDER = ["NCR", "NLZ", "SLZ", "VIS", "MIN"]
-CHART_ROW_ORDER = ["Overall", *REGION_ORDER]
-CHART_MONTH_START = pd.Period("2025-08", freq="M")
+# Buckets for ops_kpi_availability.region after trim/alias; unknown/blank → OTHER (matches SQL).
+REGION_OTHER = "OTHER"
+# Overall + five regions + OTHER; table may omit OTHER when empty (see regions_for_table).
+CHART_ROW_ORDER = ["Overall", *REGION_ORDER, REGION_OTHER]
+CHART_MONTH_START = pd.Period("2025-01", freq="M")
+
+
+def normalize_ops_kpi_region_display(raw: object) -> str:
+    """Map raw region text to NCR/NLZ/SLZ/VIS/MIN or OTHER (must stay aligned with _OPS_KPI_REGION_DISPLAY_SQL)."""
+
+    if raw is None:
+        return REGION_OTHER
+    try:
+        if pd.isna(raw):
+            return REGION_OTHER
+    except (ValueError, TypeError):
+        pass
+    s = str(raw).strip().upper()
+    if s in ("", "NAN", "NONE", "<NA>"):
+        return REGION_OTHER
+    if s == "METRO MANILA":
+        return "NCR"
+    if s in REGION_ORDER:
+        return s
+    return REGION_OTHER
+
+
+def regions_for_table(df: pd.DataFrame) -> list[str]:
+    """Primary regions in fixed order, then OTHER when any row maps to OTHER."""
+    regions = list(REGION_ORDER)
+    if not df.empty and (df["Region"] == REGION_OTHER).any():
+        regions.append(REGION_OTHER)
+    return regions
 
 _DEFAULT_T = default_ops_kpi_targets()
 EVENT_TARGET_FACTOR = _DEFAULT_T.events_baseline_factor
@@ -231,7 +287,44 @@ def load_dashboard_payload(
     )
     targets = load_ops_kpi_targets(tgt_url)
     periods = build_periods(df)
-    table_rows = build_table_rows(df, periods, targets)
+
+    grouping_col = (
+        "territory_chart_group"
+        if "territory_chart_group" in df.columns
+        else "Teritory"
+    )
+    territory_order = sorted(
+        {
+            str(x).strip()
+            for x in df[grouping_col].dropna().unique()
+            if str(x).strip() != ""
+        }
+    )
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            events_month_periods, events_month_labels = _chart_month_axes_for_payload(
+                df, cur
+            )
+            (
+                scope_outages,
+                scope_mttr,
+                scope_avail,
+                terr_outages,
+                terr_mttr,
+                terr_avail,
+            ) = fetch_monthly_charts_from_availability_only(
+                cur, events_month_periods, territory_order
+            )
+            ops_kpi_cubes = fetch_ops_kpi_availability_cubes(cur)
+
+    period_ops_index = build_period_ops_index(df, periods)
+    table_rows = build_table_rows(
+        df,
+        periods,
+        targets,
+        ops_kpi_cubes=ops_kpi_cubes,
+        period_ops_index=period_ops_index,
+    )
     table_footer = build_table_row(
         scope_frame(df, "Overall"),
         periods,
@@ -243,9 +336,25 @@ def load_dashboard_payload(
         sort_order=999999,
         group_start=False,
         group_end=True,
+        ops_kpi_table_actuals=table_ops_actuals_for_row(
+            ops_kpi_cubes,
+            period_ops_index,
+            row_kind="footer",
+            region="Overall",
+            zoo=None,
+        ),
     )
 
-    territory_order, territory_charts = build_territory_charts(df, periods, targets)
+    territory_order, territory_charts = build_territory_charts(
+        df,
+        periods,
+        targets,
+        events_month_periods=events_month_periods,
+        events_month_labels=events_month_labels,
+        events_actuals_by_territory=terr_outages,
+        mttr_actuals_by_territory=terr_mttr,
+        availability_actuals_by_territory=terr_avail,
+    )
 
     return {
         "meta": build_meta(df, periods, targets),
@@ -253,7 +362,16 @@ def load_dashboard_payload(
             "rows": table_rows,
             "footer": table_footer,
         },
-        "charts": build_charts(df, periods, targets),
+        "charts": build_charts(
+            df,
+            periods,
+            targets,
+            events_month_periods=events_month_periods,
+            events_month_labels=events_month_labels,
+            events_actuals_by_scope=scope_outages,
+            mttr_actuals_by_scope=scope_mttr,
+            availability_actuals_by_scope=scope_avail,
+        ),
         "territoryOrder": territory_order,
         "territoryCharts": territory_charts,
     }
@@ -301,8 +419,18 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
                     cm_sig = f"{row[0] or 0}|{row[1] or ''}"
             except Exception:
                 pass
+            visit_sig = ""
+            try:
+                cur.execute(
+                    "SELECT COUNT(*)::bigint, COALESCE(MAX(date)::text, '') FROM ops_kpi_sitevisit"
+                )
+                row = cur.fetchone()
+                if row:
+                    visit_sig = f"{row[0] or 0}|{row[1] or ''}"
+            except Exception:
+                pass
     max_s = max_date.isoformat() if max_date is not None else ""
-    return f"{count}|{max_s}|{tgt_sig}|{cm_sig}|cc={cm_col}"
+    return f"{count}|{max_s}|{tgt_sig}|{cm_sig}|sv={visit_sig}|cc={cm_col}"
 
 
 def ops_kpi_targets_revision(database_url: str) -> str:
@@ -355,15 +483,7 @@ def prepare_daily_availability_dataframe(
     ]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    df["Region"] = (
-        df["Region"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .replace({"METRO MANILA": "NCR"})
-    )
-    df = df[df["Region"].isin(REGION_ORDER)].copy()
+    df["Region"] = df["Region"].map(normalize_ops_kpi_region_display)
 
     has_site_table_site_id = "site_table_site_id" in df.columns
     has_fact_flag = "has_availability_row" in df.columns
@@ -545,17 +665,36 @@ def build_meta(
             },
             "mttrMinutes": targets.mttr_minutes,
             "availabilityPct": targets.availability_pct,
+            "availabilityPctNcr": targets.availability_pct_ncr,
+            "availabilityTargetLabel": (
+                f"Target ({targets.availability_pct:.2f}%; NCR {targets.availability_pct_ncr:.2f}%)"
+            ),
         },
     }
 
 
 def build_table_rows(
-    df: pd.DataFrame, periods: dict[str, pd.Series], targets: OpsKpiTargets
+    df: pd.DataFrame,
+    periods: dict[str, pd.Series],
+    targets: OpsKpiTargets,
+    *,
+    ops_kpi_cubes: OpsKpiFactCubes | None = None,
+    period_ops_index: dict[str, tuple[Literal["fy", "month"], int | date | None]]
+    | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
-    for region_index, region in enumerate(REGION_ORDER):
+    for region_index, region in enumerate(regions_for_table(df)):
         region_df = scope_frame(df, region)
         zoo_names = ordered_zoo_names(region_df)
+        region_ops: dict[str, tuple[int, float | None, float | None]] | None = None
+        if ops_kpi_cubes is not None and period_ops_index is not None:
+            region_ops = table_ops_actuals_for_row(
+                ops_kpi_cubes,
+                period_ops_index,
+                row_kind="region",
+                region=region,
+                zoo=None,
+            )
         rows.append(
             build_table_row(
                 region_df,
@@ -568,10 +707,20 @@ def build_table_rows(
                 sort_order=region_index * 1000,
                 group_start=True,
                 group_end=not zoo_names,
+                ops_kpi_table_actuals=region_ops,
             )
         )
         for zoo_index, zoo_name in enumerate(zoo_names, start=1):
             zoo_df = region_df.loc[region_df["Zoo"] == zoo_name]
+            zoo_ops: dict[str, tuple[int, float | None, float | None]] | None = None
+            if ops_kpi_cubes is not None and period_ops_index is not None:
+                zoo_ops = table_ops_actuals_for_row(
+                    ops_kpi_cubes,
+                    period_ops_index,
+                    row_kind="zoo",
+                    region=region,
+                    zoo=zoo_name,
+                )
             rows.append(
                 build_table_row(
                     zoo_df,
@@ -584,6 +733,7 @@ def build_table_rows(
                     sort_order=region_index * 1000 + zoo_index,
                     group_start=False,
                     group_end=zoo_index == len(zoo_names),
+                    ops_kpi_table_actuals=zoo_ops,
                 )
             )
     return rows
@@ -609,6 +759,9 @@ def build_table_row(
     sort_order: int = 0,
     group_start: bool = False,
     group_end: bool = False,
+    *,
+    ops_kpi_table_actuals: dict[str, tuple[int, float | None, float | None]]
+    | None = None,
 ) -> dict:
     previous_fy_label = fiscal_year_labels(periods)[0]
     baseline_events = aggregate_event_count_table(scoped_df.loc[periods[previous_fy_label]])
@@ -633,6 +786,14 @@ def build_table_row(
         cm_target = round(cm_target)
     if visit_target is not None:
         visit_target = round(visit_target)
+    if ops_kpi_table_actuals is not None:
+        ev_act = {p: ops_kpi_table_actuals[p][0] for p in periods}
+        mttr_act = {p: ops_kpi_table_actuals[p][1] for p in periods}
+        avail_act = {p: ops_kpi_table_actuals[p][2] for p in periods}
+    else:
+        ev_act = build_period_actuals(scoped_df, periods, aggregate_event_count_table)
+        mttr_act = build_period_actuals(scoped_df, periods, aggregate_mttr_minutes_table)
+        avail_act = build_period_actuals(scoped_df, periods, aggregate_availability_pct)
     return {
         "label": label or "",
         "rowKind": row_kind,
@@ -643,20 +804,20 @@ def build_table_row(
         "groupEnd": group_end,
         "siteCount": build_number_cell(count_unique_sites(scoped_df)),
         "events": build_metric_group(
-            actuals=build_period_actuals(scoped_df, periods, aggregate_event_count_table),
+            actuals=ev_act,
             target=event_target,
             kind="number",
             compare_mode="upper_is_bad",
         ),
         "mttr": build_metric_group(
-            actuals=build_period_actuals(scoped_df, periods, aggregate_mttr_minutes_table),
+            actuals=mttr_act,
             target=targets.mttr_minutes,
             kind="number",
             compare_mode="upper_is_bad",
         ),
         "availability": build_metric_group(
-            actuals=build_period_actuals(scoped_df, periods, aggregate_availability_pct),
-            target=targets.availability_pct,
+            actuals=avail_act,
+            target=availability_pct_for_region_scope(region or "Overall", targets),
             kind="percent",
             compare_mode="lower_is_bad",
         ),
@@ -754,7 +915,7 @@ def count_unique_sites(df: pd.DataFrame) -> int | None:
 
     When loading from PostgreSQL, the site×date load query supplies ``site_table_site_id`` via
     ``public.site`` (same KPI-key mapping as CM events). Same row scope as other metrics:
-    ``Region`` in ``REGION_ORDER``, ``Zoo != UNMAPPED_ZOO``, ``scope_frame`` for region rows.
+    ``Region`` in ``REGION_ORDER`` or ``OTHER``, ``Zoo != UNMAPPED_ZOO``, ``scope_frame`` for region rows.
 
     CSV / offline frames without ``site_table_site_id`` fall back to distinct canonical PTCI
     (``ptci_site_id``) for backwards compatibility.
@@ -779,13 +940,6 @@ def _fact_rows_only(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[df["has_availability_row"]]
 
 
-def aggregate_event_count(df: pd.DataFrame) -> int | None:
-    fact_df = _fact_rows_only(df)
-    if fact_df.empty:
-        return None
-    return int(fact_df["Incident_count"].fillna(0).sum())
-
-
 def aggregate_cm_count(df: pd.DataFrame) -> int | None:
     """Sum CM across every site×date row in ``df`` (same cells as the PostgreSQL load query).
 
@@ -799,10 +953,15 @@ def aggregate_cm_count(df: pd.DataFrame) -> int | None:
 
 
 def aggregate_visit_count(df: pd.DataFrame) -> int | None:
-    fact_df = _fact_rows_only(df)
-    if fact_df.empty:
+    """Sum Normal Visit across every site×date row in ``df`` (chart series + monthly targets).
+
+    Not filtered with ``_fact_rows_only``: a visit on a day without an ``ops_kpi_availability``
+    row still contributes, matching ``ops_kpi_sitevisit`` (+ site KPI key) rather than tying
+    visits to availability coverage (same rationale as ``aggregate_cm_count``).
+    """
+    if df.empty:
         return None
-    return int(fact_df["Visit Count"].fillna(0).sum())
+    return int(df["Visit Count"].fillna(0).sum())
 
 
 def aggregate_event_count_table(df: pd.DataFrame) -> int | None:
@@ -873,9 +1032,14 @@ def aggregate_availability_pct(df: pd.DataFrame) -> float | None:
 
 
 def _chart_month_axes(df: pd.DataFrame) -> tuple[pd.PeriodIndex, list[str]]:
+    if df.empty or "month_period" not in df.columns:
+        return pd.PeriodIndex([], freq="M"), []
     end_period = df["month_period"].max()
-    data_start = df["month_period"].min()
-    start_period = max(data_start, CHART_MONTH_START)
+    if pd.isna(end_period):
+        return pd.PeriodIndex([], freq="M"), []
+    start_period = CHART_MONTH_START
+    if end_period < start_period:
+        return pd.PeriodIndex([], freq="M"), []
     events_month_periods = pd.period_range(
         start=start_period, end=end_period, freq="M"
     )
@@ -885,17 +1049,593 @@ def _chart_month_axes(df: pd.DataFrame) -> tuple[pd.PeriodIndex, list[str]]:
     return events_month_periods, events_month_labels
 
 
+def _chart_month_axes_for_payload(
+    df: pd.DataFrame,
+    cur,
+) -> tuple[pd.PeriodIndex, list[str]]:
+    """Chart month axis: start at ``CHART_MONTH_START`` (Jan 2025); end at latest of merged df and ``ops_kpi_availability``."""
+
+    cur.execute("SELECT MAX(date) FROM ops_kpi_availability")
+    row = cur.fetchone()
+    max_date = row[0] if row else None
+
+    end_candidates: list[pd.Period] = []
+    if not df.empty and "month_period" in df.columns:
+        mx = df["month_period"].max()
+        if pd.notna(mx):
+            end_candidates.append(mx)
+    if max_date is not None:
+        end_candidates.append(pd.Timestamp(max_date).to_period("M"))
+
+    if not end_candidates:
+        return pd.PeriodIndex([], freq="M"), []
+
+    end_period = max(end_candidates)
+    start_period = CHART_MONTH_START
+    if end_period < start_period:
+        return pd.PeriodIndex([], freq="M"), []
+
+    events_month_periods = pd.period_range(
+        start=start_period, end=end_period, freq="M"
+    )
+    events_month_labels = [
+        period.strftime("%b %Y") for period in events_month_periods.to_timestamp()
+    ]
+    return events_month_periods, events_month_labels
+
+
+def _align_monthly_incident_sums_to_list(
+    events_month_periods: pd.PeriodIndex,
+    month_to_sum: dict,
+) -> list[int]:
+    """Map SQL ``month_start`` dates to chart month periods; missing months → 0."""
+
+    out: list[int] = []
+    for period in events_month_periods:
+        key = period.to_timestamp().normalize().date()
+        raw = month_to_sum.get(key)
+        if raw is None:
+            out.append(0)
+            continue
+        v = float(raw)
+        if not math.isfinite(v):
+            out.append(0)
+        else:
+            out.append(int(round(v)))
+    return out
+
+
+def _align_monthly_mttr_to_list(
+    events_month_periods: pd.PeriodIndex,
+    month_to_mean: dict,
+) -> list[float | None]:
+    """Map SQL month buckets to chart periods; missing months → ``None``. Values rounded to 2 dp."""
+
+    out: list[float | None] = []
+    for period in events_month_periods:
+        key = period.to_timestamp().normalize().date()
+        raw = month_to_mean.get(key)
+        if raw is None:
+            out.append(None)
+            continue
+        v = float(raw)
+        if not math.isfinite(v):
+            out.append(None)
+        else:
+            out.append(round(v, 2))
+    return out
+
+
+def _align_monthly_availability_to_list(
+    events_month_periods: pd.PeriodIndex,
+    month_to_pct: dict,
+) -> list[float | None]:
+    """Match ``monthly_availability`` rounding (4 dp); missing months → ``None``."""
+
+    out: list[float | None] = []
+    for period in events_month_periods:
+        key = period.to_timestamp().normalize().date()
+        raw = month_to_pct.get(key)
+        if raw is None:
+            out.append(None)
+            continue
+        v = float(raw)
+        if not math.isfinite(v):
+            out.append(None)
+        else:
+            out.append(round(v, 4))
+    return out
+
+
+# Weighted ``availability`` x ``total_available_minutes``, else mean clipped ``uptime_per_tenant``
+# (parity with ``aggregate_availability_pct`` on ``ops_kpi_availability`` rows).
+_AVAILABILITY_PCT_SQL = """
+(
+  CASE
+    WHEN SUM(
+      CASE
+        WHEN availability IS NOT NULL
+         AND COALESCE(total_available_minutes, 0) > 0
+        THEN COALESCE(total_available_minutes, 0)
+        ELSE 0
+      END
+    ) > 0
+    THEN
+      SUM(
+        CASE
+          WHEN availability IS NOT NULL
+           AND COALESCE(total_available_minutes, 0) > 0
+          THEN LEAST(GREATEST(availability, 0), 1)
+               * COALESCE(total_available_minutes, 0)
+          ELSE 0
+        END
+      )
+      / NULLIF(
+          SUM(
+            CASE
+              WHEN availability IS NOT NULL
+               AND COALESCE(total_available_minutes, 0) > 0
+              THEN COALESCE(total_available_minutes, 0)
+              ELSE 0
+            END
+          ),
+          0
+        )
+      * 100.0
+    ELSE
+      ( AVG(
+          LEAST(GREATEST(COALESCE(uptime_per_tenant, 0), 0), 1)
+        ) FILTER (WHERE uptime_per_tenant IS NOT NULL)
+      ) * 100.0
+  END
+)::double precision"""
+
+# Same MTTR expression as monthly chart SQL (``ops_kpi_availability`` only).
+MTTR_AVG_EXPR = """AVG(accepted_outage_minutes) FILTER (
+                   WHERE accepted_outage_minutes IS NOT NULL
+                     AND accepted_outage_minutes > 0
+               )::double precision"""
+
+# Dashboard region bucket: METRO MANILA→NCR; known five codes; else OTHER (must match normalize_ops_kpi_region_display).
+_OPS_KPI_REGION_DISPLAY_SQL = """(
+  CASE
+    WHEN UPPER(TRIM(BTRIM(COALESCE(region, '')))) = 'METRO MANILA' THEN 'NCR'
+    WHEN UPPER(TRIM(BTRIM(COALESCE(region, '')))) IN ('NCR', 'NLZ', 'SLZ', 'VIS', 'MIN')
+      THEN UPPER(TRIM(BTRIM(COALESCE(region, ''))))
+    ELSE 'OTHER'
+  END
+)"""
+_OPS_KPI_ZOO_KEY_SQL = "TRIM(BTRIM(COALESCE(zoo, '')))"
+
+
+@dataclass(frozen=True)
+class OpsKpiFactCubes:
+    """Pre-aggregated ``ops_kpi_availability`` metrics for dashboard table cells."""
+
+    year_overall: dict[int, tuple[float, float | None, float | None]]
+    year_region: dict[tuple[int, str], tuple[float, float | None, float | None]]
+    year_zoo: dict[tuple[int, str, str], tuple[float, float | None, float | None]]
+    month_overall: dict[date, tuple[float, float | None, float | None]]
+    month_region: dict[tuple[date, str], tuple[float, float | None, float | None]]
+    month_zoo: dict[tuple[date, str, str], tuple[float, float | None, float | None]]
+
+
+def _ops_kpi_raw_tuple_from_row(
+    inc: object, mttr: object, apct: object
+) -> tuple[float, float | None, float | None]:
+    inc_f = float(inc) if inc is not None else 0.0
+    if not math.isfinite(inc_f):
+        inc_f = 0.0
+    mttr_v: float | None
+    if mttr is None:
+        mttr_v = None
+    else:
+        m = float(mttr)
+        mttr_v = None if not math.isfinite(m) else round(m, 2)
+    if apct is None:
+        av_v = None
+    else:
+        a = float(apct)
+        av_v = None if not math.isfinite(a) else round(a, 4)
+    return (inc_f, mttr_v, av_v)
+
+
+def _ops_kpi_table_triple(
+    raw: tuple[float, float | None, float | None] | None,
+) -> tuple[int, float | None, float | None]:
+    """Chart-aligned table cells: outages default 0 when absent; MTTR/avail may be None."""
+    if raw is None:
+        return (0, None, None)
+    inc_f, mttr_v, av_v = raw
+    ev = int(round(inc_f)) if math.isfinite(inc_f) else 0
+    return (ev, mttr_v, av_v)
+
+
+def fetch_ops_kpi_availability_cubes(cur) -> OpsKpiFactCubes:
+    """Six grouped queries over ``ops_kpi_availability`` (same aggregates as chart SQL)."""
+
+    agg = f"""
+      SUM(COALESCE(incident_count, 0))::double precision,
+      {MTTR_AVG_EXPR},
+      {_AVAILABILITY_PCT_SQL}
+    """
+
+    cur.execute(
+        f"""
+        SELECT EXTRACT(YEAR FROM date)::int AS yr, {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1
+        ORDER BY 1
+        """
+    )
+    year_overall: dict[int, tuple[float, float | None, float | None]] = {}
+    for row in cur.fetchall():
+        yr = int(row[0])
+        year_overall[yr] = _ops_kpi_raw_tuple_from_row(row[1], row[2], row[3])
+
+    cur.execute(
+        f"""
+        SELECT EXTRACT(YEAR FROM date)::int AS yr,
+               {_OPS_KPI_REGION_DISPLAY_SQL} AS rk,
+               {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2
+        """
+    )
+    year_region: dict[tuple[int, str], tuple[float, float | None, float | None]] = {}
+    for row in cur.fetchall():
+        yr, rk = int(row[0]), str(row[1])
+        year_region[(yr, rk)] = _ops_kpi_raw_tuple_from_row(row[2], row[3], row[4])
+
+    cur.execute(
+        f"""
+        SELECT EXTRACT(YEAR FROM date)::int AS yr,
+               {_OPS_KPI_REGION_DISPLAY_SQL} AS rk,
+               {_OPS_KPI_ZOO_KEY_SQL} AS zk,
+               {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2, 3
+        """
+    )
+    year_zoo: dict[tuple[int, str, str], tuple[float, float | None, float | None]] = {}
+    for row in cur.fetchall():
+        yr, rk, zk = int(row[0]), str(row[1]), str(row[2])
+        year_zoo[(yr, rk, zk)] = _ops_kpi_raw_tuple_from_row(row[3], row[4], row[5])
+
+    cur.execute(
+        f"""
+        SELECT date_trunc('month', date)::date AS ms, {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1
+        ORDER BY 1
+        """
+    )
+    month_overall: dict[date, tuple[float, float | None, float | None]] = {}
+    for row in cur.fetchall():
+        ms = row[0]
+        if hasattr(ms, "date"):
+            ms = ms.date()
+        month_overall[ms] = _ops_kpi_raw_tuple_from_row(row[1], row[2], row[3])
+
+    cur.execute(
+        f"""
+        SELECT date_trunc('month', date)::date AS ms,
+               {_OPS_KPI_REGION_DISPLAY_SQL} AS rk,
+               {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2
+        """
+    )
+    month_region: dict[tuple[date, str], tuple[float, float | None, float | None]] = {}
+    for row in cur.fetchall():
+        ms = row[0]
+        if hasattr(ms, "date"):
+            ms = ms.date()
+        rk = str(row[1])
+        month_region[(ms, rk)] = _ops_kpi_raw_tuple_from_row(row[2], row[3], row[4])
+
+    cur.execute(
+        f"""
+        SELECT date_trunc('month', date)::date AS ms,
+               {_OPS_KPI_REGION_DISPLAY_SQL} AS rk,
+               {_OPS_KPI_ZOO_KEY_SQL} AS zk,
+               {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2, 3
+        """
+    )
+    month_zoo: dict[tuple[date, str, str], tuple[float, float | None, float | None]] = {}
+    for row in cur.fetchall():
+        ms = row[0]
+        if hasattr(ms, "date"):
+            ms = ms.date()
+        rk, zk = str(row[1]), str(row[2])
+        month_zoo[(ms, rk, zk)] = _ops_kpi_raw_tuple_from_row(row[3], row[4], row[5])
+
+    return OpsKpiFactCubes(
+        year_overall=year_overall,
+        year_region=year_region,
+        year_zoo=year_zoo,
+        month_overall=month_overall,
+        month_region=month_region,
+        month_zoo=month_zoo,
+    )
+
+
+def build_period_ops_index(
+    df: pd.DataFrame, periods: dict[str, pd.Series]
+) -> dict[str, tuple[Literal["fy", "month"], int | date | None]]:
+    """Map each table period key to a fiscal year or calendar month start (for cube lookup)."""
+    out: dict[str, tuple[Literal["fy", "month"], int | date | None]] = {}
+    for name, mask in periods.items():
+        if name.startswith("FY"):
+            out[name] = ("fy", int(name[2:]))
+        else:
+            sub = df.loc[mask, "Date"]
+            if sub.empty:
+                out[name] = ("month", None)
+            else:
+                ms = (
+                    pd.Timestamp(sub.min()).to_period("M").to_timestamp().normalize().date()
+                )
+                out[name] = ("month", ms)
+    return out
+
+
+def table_ops_actuals_for_row(
+    cubes: OpsKpiFactCubes,
+    period_ops_index: dict[str, tuple[Literal["fy", "month"], int | date | None]],
+    *,
+    row_kind: str,
+    region: str | None,
+    zoo: str | None,
+) -> dict[str, tuple[int, float | None, float | None]]:
+    """Outages / MTTR / availability actuals per period from pre-fetched cubes."""
+    actuals: dict[str, tuple[int, float | None, float | None]] = {}
+    for pk, kind_y in period_ops_index.items():
+        kind, y_or_ms = kind_y
+        raw: tuple[float, float | None, float | None] | None = None
+        if kind == "fy":
+            assert isinstance(y_or_ms, int)
+            yr = y_or_ms
+            if row_kind == "footer":
+                raw = cubes.year_overall.get(yr)
+            elif row_kind == "region" and region is not None:
+                raw = cubes.year_region.get((yr, region))
+            elif row_kind == "zoo" and region is not None and zoo is not None:
+                raw = cubes.year_zoo.get((yr, region, zoo))
+        else:
+            ms = y_or_ms
+            if ms is None:
+                raw = None
+            elif row_kind == "footer":
+                raw = cubes.month_overall.get(ms)
+            elif row_kind == "region" and region is not None:
+                raw = cubes.month_region.get((ms, region))
+            elif row_kind == "zoo" and region is not None and zoo is not None:
+                raw = cubes.month_zoo.get((ms, region, zoo))
+        actuals[pk] = _ops_kpi_table_triple(raw)
+    return actuals
+
+
+def period_date_range_for_insight(
+    df: pd.DataFrame, periods: dict[str, pd.Series], period_key: str
+) -> tuple[date | None, date | None]:
+    if period_key not in periods:
+        return (None, None)
+    sub = df.loc[periods[period_key], "Date"]
+    if sub.empty:
+        return (None, None)
+    return (
+        pd.Timestamp(sub.min()).date(),
+        pd.Timestamp(sub.max()).date(),
+    )
+
+
+def fetch_ops_kpi_metrics_for_date_range(
+    cur,
+    date_start: date,
+    date_end: date,
+    *,
+    row_kind: str,
+    region: str | None,
+    zoo: str | None,
+) -> tuple[int, float | None, float | None]:
+    """Single-period aggregates from ``ops_kpi_availability`` (same expressions as charts)."""
+
+    where = ["date >= %s", "date <= %s"]
+    params: list[object] = [date_start, date_end]
+    if row_kind == "region":
+        if not region:
+            raise ValueError("region is required for row_kind region")
+        where.append(f"{_OPS_KPI_REGION_DISPLAY_SQL} = %s")
+        params.append(region)
+    elif row_kind == "zoo":
+        if not region or not zoo:
+            raise ValueError("region and zoo are required for row_kind zoo")
+        where.append(f"{_OPS_KPI_REGION_DISPLAY_SQL} = %s")
+        params.append(region)
+        where.append(f"{_OPS_KPI_ZOO_KEY_SQL} = %s")
+        params.append(zoo)
+    elif row_kind != "footer":
+        raise ValueError(f"Invalid row_kind: {row_kind}")
+
+    agg = f"""
+      SUM(COALESCE(incident_count, 0))::double precision,
+      {MTTR_AVG_EXPR},
+      {_AVAILABILITY_PCT_SQL}
+    """
+    cur.execute(
+        f"""
+        SELECT {agg}
+        FROM ops_kpi_availability
+        WHERE {' AND '.join(where)}
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    if not row:
+        return (0, None, None)
+    raw = _ops_kpi_raw_tuple_from_row(row[0], row[1], row[2])
+    return _ops_kpi_table_triple(raw)
+
+
+def fetch_monthly_charts_from_availability_only(
+    cur,
+    events_month_periods: pd.PeriodIndex,
+    territory_order: list[str],
+) -> tuple[
+    dict[str, list[int]],
+    dict[str, list[float | None]],
+    dict[str, list[float | None]],
+    dict[str, list[int]],
+    dict[str, list[float | None]],
+    dict[str, list[float | None]],
+]:
+    """Outages, MTTR, and availability chart series from ``ops_kpi_availability`` (one query per grain)."""
+
+    n = len(events_month_periods)
+    if n == 0:
+        empty_s = {s: [] for s in CHART_ROW_ORDER}
+        empty_tr = {t: [] for t in territory_order}
+        return (
+            empty_s,
+            {s: [] for s in CHART_ROW_ORDER},
+            {s: [] for s in CHART_ROW_ORDER},
+            {t: [] for t in territory_order},
+            {t: [] for t in territory_order},
+            {t: [] for t in territory_order},
+        )
+
+    cur.execute(
+        f"""
+        SELECT date_trunc('month', date)::date AS month_start,
+               SUM(COALESCE(incident_count, 0))::double precision,
+               {MTTR_AVG_EXPR},
+               {_AVAILABILITY_PCT_SQL}
+        FROM ops_kpi_availability
+        GROUP BY 1
+        ORDER BY 1
+        """
+    )
+    overall_inc: dict = {}
+    overall_mttr: dict = {}
+    overall_avail: dict = {}
+    for row in cur.fetchall():
+        ms, inc_sum, mttr_avg, apct = row[0], row[1], row[2], row[3]
+        overall_inc[ms] = float(inc_sum) if inc_sum is not None else 0.0
+        overall_mttr[ms] = None if mttr_avg is None else float(mttr_avg)
+        overall_avail[ms] = None if apct is None else float(apct)
+
+    cur.execute(
+        f"""
+        SELECT date_trunc('month', date)::date AS month_start,
+               {_OPS_KPI_REGION_DISPLAY_SQL} AS region_key,
+               SUM(COALESCE(incident_count, 0))::double precision,
+               {MTTR_AVG_EXPR},
+               {_AVAILABILITY_PCT_SQL}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2
+        """
+    )
+    per_region_inc: dict[str, dict] = {}
+    per_region_mttr: dict[str, dict] = {}
+    per_region_avail: dict[str, dict] = {}
+    for row in cur.fetchall():
+        ms, rk, inc_sum, mttr_avg, apct = row[0], row[1], row[2], row[3], row[4]
+        per_region_inc.setdefault(rk, {})[ms] = (
+            float(inc_sum) if inc_sum is not None else 0.0
+        )
+        per_region_mttr.setdefault(rk, {})[ms] = (
+            None if mttr_avg is None else float(mttr_avg)
+        )
+        per_region_avail.setdefault(rk, {})[ms] = None if apct is None else float(apct)
+
+    scope_inc: dict[str, list[int]] = {
+        "Overall": _align_monthly_incident_sums_to_list(events_month_periods, overall_inc)
+    }
+    scope_mttr: dict[str, list[float | None]] = {
+        "Overall": _align_monthly_mttr_to_list(events_month_periods, overall_mttr)
+    }
+    scope_avail: dict[str, list[float | None]] = {
+        "Overall": _align_monthly_availability_to_list(
+            events_month_periods, overall_avail
+        )
+    }
+    for scope in CHART_ROW_ORDER:
+        if scope == "Overall":
+            continue
+        scope_inc[scope] = _align_monthly_incident_sums_to_list(
+            events_month_periods, per_region_inc.get(scope, {})
+        )
+        scope_mttr[scope] = _align_monthly_mttr_to_list(
+            events_month_periods, per_region_mttr.get(scope, {})
+        )
+        scope_avail[scope] = _align_monthly_availability_to_list(
+            events_month_periods, per_region_avail.get(scope, {})
+        )
+
+    cur.execute(
+        f"""
+        SELECT date_trunc('month', date)::date AS month_start,
+               TRIM(BTRIM(COALESCE(territory, ''))) AS territory_key,
+               SUM(COALESCE(incident_count, 0))::double precision,
+               {MTTR_AVG_EXPR},
+               {_AVAILABILITY_PCT_SQL}
+        FROM ops_kpi_availability
+        WHERE TRIM(BTRIM(COALESCE(territory, ''))) <> ''
+        GROUP BY 1, 2
+        """
+    )
+    per_terr_inc: dict[str, dict] = {}
+    per_terr_mttr: dict[str, dict] = {}
+    per_terr_avail: dict[str, dict] = {}
+    for row in cur.fetchall():
+        ms, tk, inc_sum, mttr_avg, apct = row[0], row[1], row[2], row[3], row[4]
+        per_terr_inc.setdefault(tk, {})[ms] = (
+            float(inc_sum) if inc_sum is not None else 0.0
+        )
+        per_terr_mttr.setdefault(tk, {})[ms] = (
+            None if mttr_avg is None else float(mttr_avg)
+        )
+        per_terr_avail.setdefault(tk, {})[ms] = None if apct is None else float(apct)
+
+    terr_inc: dict[str, list[int]] = {
+        t: _align_monthly_incident_sums_to_list(
+            events_month_periods, per_terr_inc.get(t, {})
+        )
+        for t in territory_order
+    }
+    terr_mttr: dict[str, list[float | None]] = {
+        t: _align_monthly_mttr_to_list(events_month_periods, per_terr_mttr.get(t, {}))
+        for t in territory_order
+    }
+    terr_avail: dict[str, list[float | None]] = {
+        t: _align_monthly_availability_to_list(
+            events_month_periods, per_terr_avail.get(t, {})
+        )
+        for t in territory_order
+    }
+
+    return scope_inc, scope_mttr, scope_avail, terr_inc, terr_mttr, terr_avail
+
+
 def _chart_bundle_for_scoped_df(
     scoped_df: pd.DataFrame,
     periods: dict[str, pd.Series],
     targets: OpsKpiTargets,
     events_month_periods: pd.PeriodIndex,
     events_month_labels: list[str],
+    *,
+    availability_region_for_target: str | None = None,
+    events_actual_outages: list[int] | None = None,
+    mttr_actual_outages: list[float | None] | None = None,
+    availability_actual: list[float | None] | None = None,
 ) -> dict:
     event_target_series = build_monthly_target_series(
         scoped_df,
         periods,
-        aggregate_event_count,
+        aggregate_event_count_table,
         events_month_periods,
         targets.events_baseline_factor,
     )
@@ -914,24 +1654,42 @@ def _chart_bundle_for_scoped_df(
         targets.visit_baseline_factor,
     )
     mt = targets.mttr_minutes
-    av = targets.availability_pct
+    if availability_region_for_target is None:
+        av = targets.availability_pct
+    else:
+        av = availability_pct_for_region_scope(availability_region_for_target, targets)
+    events_values = (
+        events_actual_outages
+        if events_actual_outages is not None
+        else monthly_events(scoped_df, events_month_periods)
+    )
+    mttr_values = (
+        mttr_actual_outages
+        if mttr_actual_outages is not None
+        else monthly_mttr(scoped_df, events_month_periods)
+    )
+    availability_values = (
+        availability_actual
+        if availability_actual is not None
+        else monthly_availability(scoped_df, events_month_periods)
+    )
     return {
         "events": {
             "available": True,
             "months": events_month_labels,
-            "actual": monthly_events(scoped_df, events_month_periods),
+            "actual": events_values,
             "target": event_target_series,
         },
         "mttr": {
             "available": True,
             "months": events_month_labels,
-            "actual": monthly_mttr(scoped_df, events_month_periods),
+            "actual": mttr_values,
             "target": [mt] * len(events_month_periods),
         },
         "availability": {
             "available": True,
             "months": events_month_labels,
-            "actual": monthly_availability(scoped_df, events_month_periods),
+            "actual": availability_values,
             "target": [av] * len(events_month_periods),
         },
         "cm": {
@@ -950,9 +1708,16 @@ def _chart_bundle_for_scoped_df(
 
 
 def build_charts(
-    df: pd.DataFrame, periods: dict[str, pd.Series], targets: OpsKpiTargets
+    df: pd.DataFrame,
+    periods: dict[str, pd.Series],
+    targets: OpsKpiTargets,
+    *,
+    events_month_periods: pd.PeriodIndex,
+    events_month_labels: list[str],
+    events_actuals_by_scope: dict[str, list[int]],
+    mttr_actuals_by_scope: dict[str, list[float | None]],
+    availability_actuals_by_scope: dict[str, list[float | None]],
 ) -> dict:
-    events_month_periods, events_month_labels = _chart_month_axes(df)
     charts = {}
     for scope in CHART_ROW_ORDER:
         scoped_df = scope_frame(df, scope)
@@ -962,14 +1727,25 @@ def build_charts(
             targets,
             events_month_periods,
             events_month_labels,
+            availability_region_for_target=scope,
+            events_actual_outages=events_actuals_by_scope[scope],
+            mttr_actual_outages=mttr_actuals_by_scope[scope],
+            availability_actual=availability_actuals_by_scope[scope],
         )
     return charts
 
 
 def build_territory_charts(
-    df: pd.DataFrame, periods: dict[str, pd.Series], targets: OpsKpiTargets
+    df: pd.DataFrame,
+    periods: dict[str, pd.Series],
+    targets: OpsKpiTargets,
+    *,
+    events_month_periods: pd.PeriodIndex,
+    events_month_labels: list[str],
+    events_actuals_by_territory: dict[str, list[int]],
+    mttr_actuals_by_territory: dict[str, list[float | None]],
+    availability_actuals_by_territory: dict[str, list[float | None]],
 ) -> tuple[list[str], dict[str, dict]]:
-    events_month_periods, events_month_labels = _chart_month_axes(df)
     grouping_col = "territory_chart_group"
     if grouping_col not in df.columns:
         grouping_col = "Teritory"
@@ -989,15 +1765,25 @@ def build_territory_charts(
             targets,
             events_month_periods,
             events_month_labels,
+            availability_region_for_target=None,
+            events_actual_outages=events_actuals_by_territory[t],
+            mttr_actual_outages=mttr_actuals_by_territory[t],
+            availability_actual=availability_actuals_by_territory[t],
         )
     return territory_order, charts
 
 
-def monthly_events(df: pd.DataFrame, month_periods: pd.PeriodIndex) -> list[int | None]:
-    values: list[int | None] = []
+def monthly_events(df: pd.DataFrame, month_periods: pd.PeriodIndex) -> list[int]:
+    """Calendar-month sum of ``Incident_count`` (same semantics as the KPI table)."""
+
+    values: list[int] = []
     for period in month_periods:
-        value = aggregate_event_count(df.loc[df["month_period"] == period])
-        values.append(int(value) if value is not None else None)
+        sub = df.loc[df["month_period"] == period]
+        if sub.empty:
+            values.append(0)
+        else:
+            v = aggregate_event_count_table(sub)
+            values.append(int(v) if v is not None else 0)
     return values
 
 

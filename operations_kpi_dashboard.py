@@ -233,6 +233,7 @@ def make_handler(
                     metric,
                     period,
                     ops_targets,
+                    database_url=database_url,
                 )
                 self._send_json(payload)
             except ValueError as exc:

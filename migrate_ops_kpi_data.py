@@ -35,6 +35,25 @@ INSERT_CM = """
 INSERT INTO ops_kpi_cm (site_id, date, cm_count) VALUES (%s, %s, %s)
 """
 
+# Map KPI keys (PLA when present, else site PK) to canonical site.site_id; merge duplicate keys.
+_NORMALIZE_SITEVISIT_UPDATE = """
+UPDATE ops_kpi_sitevisit v
+SET site_id = s.site_id::text
+FROM site s
+WHERE v.site_id::text = COALESCE(NULLIF(BTRIM(s.pla_id::text), ''), s.site_id::text)
+  AND v.site_id::text IS DISTINCT FROM s.site_id::text
+"""
+
+_NORMALIZE_SITEVISIT_VIA_AVAIL_PTCI = """
+UPDATE ops_kpi_sitevisit v
+SET site_id = s.site_id::text
+FROM ops_kpi_availability a
+INNER JOIN site s ON s.site_id = NULLIF(BTRIM(a.ptci_number::text), '')
+WHERE v.site_id = a.site_id
+  AND v.date = a.date
+  AND v.site_id::text IS DISTINCT FROM s.site_id::text
+"""
+
 _BATCH = 10_000
 
 
@@ -118,15 +137,39 @@ def _executemany_batches(cur, sql: str, rows: list[tuple]) -> None:
         cur.executemany(sql, rows[i : i + _BATCH])
 
 
+def _normalize_ops_kpi_sitevisit(cur: psycopg.Cursor) -> None:
+    """Align sitevisit.site_id with public.site.site_id; collapse duplicate PKs with summed counts."""
+    cur.execute(_NORMALIZE_SITEVISIT_UPDATE)
+    cur.execute(_NORMALIZE_SITEVISIT_VIA_AVAIL_PTCI)
+    cur.execute(
+        """
+        CREATE TEMP TABLE _ops_kpi_sitevisit_merged AS
+        SELECT site_id, date, SUM(visit_count)::integer AS visit_count
+        FROM ops_kpi_sitevisit
+        GROUP BY site_id, date
+        """
+    )
+    cur.execute("TRUNCATE ops_kpi_sitevisit")
+    cur.execute(
+        """
+        INSERT INTO ops_kpi_sitevisit (site_id, date, visit_count)
+        SELECT site_id, date, visit_count FROM _ops_kpi_sitevisit_merged
+        """
+    )
+    cur.execute("DROP TABLE _ops_kpi_sitevisit_merged")
+
+
 def migrate(conn: psycopg.Connection, df: pd.DataFrame) -> None:
     avail, visits, cms = build_rows_simple(df)
     with conn.cursor() as cur:
-        cur.execute("TRUNCATE ops_kpi_availability CASCADE")
+        # No FK from sitevisit/cm into availability; truncate all fact tables explicitly.
+        cur.execute("TRUNCATE ops_kpi_availability, ops_kpi_sitevisit, ops_kpi_cm")
         _executemany_batches(cur, INSERT_AVAILABILITY, avail)
         _executemany_batches(cur, INSERT_VISIT, visits)
+        _normalize_ops_kpi_sitevisit(cur)
         _executemany_batches(cur, INSERT_CM, cms)
     conn.commit()
-    print(f"Inserted {len(avail)} rows (availability + sitevisit + cm).")
+    print(f"Inserted {len(avail)} availability, {len(visits)} sitevisit, {len(cms)} cm rows.")
 
 
 def parse_args() -> argparse.Namespace:

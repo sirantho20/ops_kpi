@@ -294,6 +294,11 @@
 
     <script>
         const dashboardData = __DASHBOARD_DATA__;
+        const targetUi = (dashboardData.meta && dashboardData.meta.targetUi) || {};
+        const availabilityChartCaption =
+            targetUi.availabilityPct != null && targetUi.availabilityPctNcr != null
+                ? String(targetUi.availabilityPct) + '% / NCR ' + String(targetUi.availabilityPctNcr) + '%'
+                : '99.96%';
         const metricConfigs = [
             {
                 id: 'events',
@@ -314,7 +319,7 @@
                 title: 'AVAILABILITY (%)',
                 groupClass: 'bg-green-500 text-white',
                 subHeaderClass: 'bg-avail font-semibold',
-                targetLabel: 'Target (99.96%)'
+                targetLabel: targetUi.availabilityTargetLabel || 'Target (99.96%)'
             },
             {
                 id: 'cm',
@@ -339,7 +344,7 @@
         const chartTypes = [
             { id: 'events', title: 'Outages\n(< 15%)', color1: '#3b82f6', color2: '#fb923c', isPercent: false },
             { id: 'mttr', title: 'MTTR Performance\n(3 Hours)', color1: '#FFA500', color2: '#22c55e', isPercent: false },
-            { id: 'availability', title: 'Availability Performance\n(99.96%)', color1: '#008000', color2: '#3b82f6', isPercent: true },
+            { id: 'availability', title: 'Availability Performance\n(' + availabilityChartCaption + ')', color1: '#008000', color2: '#3b82f6', isPercent: true },
             { id: 'cm', title: 'CM Count\n(<15%)', color1: '#800080', color2: '#eab308', isPercent: false },
             { id: 'visit', title: 'Normal Visit\n(<15%)', color1: '#FFC0CB', color2: '#f43f5e', isPercent: false }
         ];

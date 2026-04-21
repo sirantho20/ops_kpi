@@ -17,24 +17,20 @@ CREATE TABLE IF NOT EXISTS ops_kpi_availability (
     PRIMARY KEY (site_id, date)
 );
 
+-- site_id is canonical public.site.site_id (not PLA). FK is added in ops_kpi_sitevisit_fk_to_site.sql
+-- after public.site exists; greenfield DBs should run that migration once site is loaded.
 CREATE TABLE IF NOT EXISTS ops_kpi_sitevisit (
     site_id TEXT NOT NULL,
     date DATE NOT NULL,
     visit_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (site_id, date),
-    FOREIGN KEY (site_id, date)
-        REFERENCES ops_kpi_availability (site_id, date)
-        ON DELETE CASCADE
+    PRIMARY KEY (site_id, date)
 );
 
 CREATE TABLE IF NOT EXISTS ops_kpi_cm (
     site_id TEXT NOT NULL,
     date DATE NOT NULL,
     cm_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (site_id, date),
-    FOREIGN KEY (site_id, date)
-        REFERENCES ops_kpi_availability (site_id, date)
-        ON DELETE CASCADE
+    PRIMARY KEY (site_id, date)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ops_kpi_availability_date ON ops_kpi_availability (date);
@@ -52,5 +48,6 @@ INSERT INTO ops_kpi_targets (metric_key, value) VALUES
     ('cm_baseline_factor', 0.85),
     ('visit_baseline_factor', 0.85),
     ('mttr_minutes', 200),
-    ('availability_pct', 99.96)
+    ('availability_pct', 99.96),
+    ('availability_pct_ncr', 99.98)
 ON CONFLICT (metric_key) DO NOTHING;
