@@ -7,6 +7,7 @@ import unittest
 import pandas as pd
 
 from operations_kpi_data import (
+    CHART_MONTH_COUNT,
     CHART_MONTH_START,
     _align_monthly_availability_to_list,
     _align_monthly_incident_sums_to_list,
@@ -62,9 +63,10 @@ class ChartMonthAxesForPayloadTests(unittest.TestCase):
             }
         )
         periods, labels = _chart_month_axes_for_payload(df, FakeCur())
-        self.assertEqual(str(periods[0]), "2025-01")
+        self.assertEqual(str(periods[0]), "2025-07")
         self.assertEqual(str(periods[-1]), "2026-06")
-        self.assertEqual(len(periods), 18)
+        self.assertEqual(len(periods), CHART_MONTH_COUNT)
+        self.assertEqual(labels[0], "Jul 2025")
         self.assertEqual(labels[-1], "Jun 2026")
 
 

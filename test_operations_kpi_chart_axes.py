@@ -6,13 +6,13 @@ import unittest
 
 import pandas as pd
 
-from operations_kpi_data import CHART_MONTH_START, _chart_month_axes
+from operations_kpi_data import CHART_MONTH_COUNT, _chart_month_axes
 
 
 class ChartMonthAxesTests(unittest.TestCase):
-    """_chart_month_axes must start at CHART_MONTH_START, not df['month_period'].min()."""
+    """_chart_month_axes must return the latest rolling chart window."""
 
-    def test_starts_january_2025_when_data_starts_august_2025(self) -> None:
+    def test_returns_latest_twelve_months_when_data_spans_more(self) -> None:
         df = pd.DataFrame(
             {
                 "month_period": [
@@ -23,11 +23,11 @@ class ChartMonthAxesTests(unittest.TestCase):
         )
         periods, labels = _chart_month_axes(df)
         expected = pd.period_range(
-            start=CHART_MONTH_START, end=pd.Period("2026-03", "M"), freq="M"
+            end=pd.Period("2026-03", "M"), periods=CHART_MONTH_COUNT, freq="M"
         )
-        self.assertEqual(len(periods), len(expected))
+        self.assertEqual(len(periods), CHART_MONTH_COUNT)
         self.assertEqual(list(periods), list(expected))
-        self.assertEqual(labels[0], "Jan 2025")
+        self.assertEqual(labels[0], "Apr 2025")
         self.assertEqual(labels[-1], "Mar 2026")
 
 

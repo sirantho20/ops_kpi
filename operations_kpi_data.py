@@ -208,8 +208,8 @@ def _ops_kpi_load_sql(*, has_ops_kpi_cm_count: bool, sic_columns: OpsKpiSicColum
 -- Site-first dataset: every site across the dashboard date axis, with blank metrics when no
 -- matching availability fact row exists for (kpi_site_id, date).
 -- Date axis includes any calendar day present in availability, CM, or SIC so FY table
--- totals include full-year facts. Charts use a fixed monthly axis from CHART_MONTH_START (Jan 2025)
--- through the latest month present in loaded data.
+-- totals include full-year facts. Charts use a rolling monthly axis ending at the latest
+-- month present in loaded data.
 WITH site_dim AS (
     SELECT DISTINCT ON (
         COALESCE(
@@ -337,6 +337,7 @@ REGION_OTHER = "OTHER"
 # Overall + five regions + OTHER; table may omit OTHER when empty (see regions_for_table).
 CHART_ROW_ORDER = ["Overall", *REGION_ORDER, REGION_OTHER]
 CHART_MONTH_START = pd.Period("2025-01", freq="M")
+CHART_MONTH_COUNT = 12
 
 
 def normalize_ops_kpi_region_display(raw: object) -> str:
@@ -1160,15 +1161,10 @@ def aggregate_availability_pct(df: pd.DataFrame) -> float | None:
     return float(fallback.mean() * 100)
 
 
-def _chart_month_axes(df: pd.DataFrame) -> tuple[pd.PeriodIndex, list[str]]:
-    if df.empty or "month_period" not in df.columns:
-        return pd.PeriodIndex([], freq="M"), []
-    end_period = df["month_period"].max()
-    if pd.isna(end_period):
-        return pd.PeriodIndex([], freq="M"), []
-    start_period = CHART_MONTH_START
-    if end_period < start_period:
-        return pd.PeriodIndex([], freq="M"), []
+def _rolling_chart_month_axes(
+    end_period: pd.Period,
+) -> tuple[pd.PeriodIndex, list[str]]:
+    start_period = end_period - (CHART_MONTH_COUNT - 1)
     events_month_periods = pd.period_range(
         start=start_period, end=end_period, freq="M"
     )
@@ -1178,11 +1174,20 @@ def _chart_month_axes(df: pd.DataFrame) -> tuple[pd.PeriodIndex, list[str]]:
     return events_month_periods, events_month_labels
 
 
+def _chart_month_axes(df: pd.DataFrame) -> tuple[pd.PeriodIndex, list[str]]:
+    if df.empty or "month_period" not in df.columns:
+        return pd.PeriodIndex([], freq="M"), []
+    end_period = df["month_period"].max()
+    if pd.isna(end_period):
+        return pd.PeriodIndex([], freq="M"), []
+    return _rolling_chart_month_axes(end_period)
+
+
 def _chart_month_axes_for_payload(
     df: pd.DataFrame,
     cur,
 ) -> tuple[pd.PeriodIndex, list[str]]:
-    """Chart month axis: start at ``CHART_MONTH_START`` (Jan 2025); end at latest of merged df and ``ops_kpi_availability``."""
+    """Chart month axis: rolling 12 months ending at latest merged df/availability month."""
 
     cur.execute("SELECT MAX(date) FROM ops_kpi_availability")
     row = cur.fetchone()
@@ -1200,17 +1205,7 @@ def _chart_month_axes_for_payload(
         return pd.PeriodIndex([], freq="M"), []
 
     end_period = max(end_candidates)
-    start_period = CHART_MONTH_START
-    if end_period < start_period:
-        return pd.PeriodIndex([], freq="M"), []
-
-    events_month_periods = pd.period_range(
-        start=start_period, end=end_period, freq="M"
-    )
-    events_month_labels = [
-        period.strftime("%b %Y") for period in events_month_periods.to_timestamp()
-    ]
-    return events_month_periods, events_month_labels
+    return _rolling_chart_month_axes(end_period)
 
 
 def _align_monthly_incident_sums_to_list(
