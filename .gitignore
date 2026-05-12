@@ -2,8 +2,8 @@
 .venv/
 .venv_migrate/
 venv/
-ops_kpi_sitevisit_backup_pre_fk.csv
-ops_kpi_sitevisit_pre_fk.dump
+ops_kpi_sic_backup_pre_fk.csv
+ops_kpi_sic_pre_fk.dump
 __pycache__/
 *.pyc
 .pytest_cache/

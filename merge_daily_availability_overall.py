@@ -39,7 +39,7 @@ LEGACY_COLUMNS = [
     "Incident_count",
     "Outage_mins",
     "Uptime_per_tenant",
-    "Visit Count",
+    "SIC Count",
     "CM Count",
     "Zoo",
 ]
@@ -155,18 +155,18 @@ def load_dispatch_metrics(
     data = dispatch.loc[:, ["Site ID", "Problem Start Date: Day", "NV", "CM"]].copy()
     data["Site ID"] = normalize_identifier_series(data["Site ID"])
     data["Date"] = pd.to_datetime(data["Problem Start Date: Day"], errors="coerce").dt.normalize()
-    data["Visit Count"] = pd.to_numeric(data["NV"], errors="coerce")
+    data["SIC Count"] = pd.to_numeric(data["NV"], errors="coerce")
     data["CM Count"] = pd.to_numeric(data["CM"], errors="coerce")
     data = data.drop(columns=["Problem Start Date: Day", "NV", "CM"])
     data = data.dropna(subset=["Site ID", "Date"])
-    data = data.loc[data[["Visit Count", "CM Count"]].notna().any(axis=1)].copy()
+    data = data.loc[data[["SIC Count", "CM Count"]].notna().any(axis=1)].copy()
 
     grouped = (
-        data.groupby(["Site ID", "Date"], dropna=False)[["Visit Count", "CM Count"]]
+        data.groupby(["Site ID", "Date"], dropna=False)[["SIC Count", "CM Count"]]
         .sum(min_count=1)
         .reset_index()
     )
-    grouped["Visit Count"] = grouped["Visit Count"].fillna(0).astype(int)
+    grouped["SIC Count"] = grouped["SIC Count"].fillna(0).astype(int)
     grouped["CM Count"] = grouped["CM Count"].fillna(0).astype(int)
     return grouped
 
@@ -183,14 +183,14 @@ def merge_dispatch_metrics(
 ) -> pd.DataFrame:
     """Attach NV/CM from dispatch with an outer join on (PTCI / Site ID, Date).
 
-    Dispatch-only keys are kept so normal visits count at site×date grain without
+    Dispatch-only keys are kept so SIC counts at site×date grain without
     requiring an availability row for that day.
     """
     merged = availability_df.copy()
     merged["Date"] = pd.to_datetime(merged["Date"], errors="coerce").dt.normalize()
     merged["_dispatch_site_id"] = normalize_identifier_series(merged["PTCI Number"])
 
-    for column in ("Visit Count", "CM Count"):
+    for column in ("SIC Count", "CM Count"):
         if column in merged.columns:
             merged = merged.drop(columns=[column])
 
@@ -217,7 +217,7 @@ def merge_dispatch_metrics(
     merged["PLA ID"] = normalize_identifier_series(merged["PLA ID"].fillna(key.map(pla_map)))
     merged["Region"] = merged["Region"].fillna(key.map(region_map))
     merged = merged.drop(columns=["_dispatch_site_id", "Site ID"])
-    merged["Visit Count"] = pd.to_numeric(merged["Visit Count"], errors="coerce").fillna(0).astype(int)
+    merged["SIC Count"] = pd.to_numeric(merged["SIC Count"], errors="coerce").fillna(0).astype(int)
     merged["CM Count"] = pd.to_numeric(merged["CM Count"], errors="coerce").fillna(0).astype(int)
     return merged
 
@@ -515,7 +515,7 @@ def main() -> None:
     )
     print(
         "Dispatch totals merged into output: "
-        f"Visit Count={int(merged['Visit Count'].sum()):,}, "
+        f"SIC Count={int(merged['SIC Count'].sum()):,}, "
         f"CM Count={int(merged['CM Count'].sum()):,}"
     )
     mapped_zoo_sites = int(merged.loc[merged["Zoo"].notna(), "PTCI Number"].nunique())

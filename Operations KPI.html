@@ -37,7 +37,7 @@
         .bg-mttr { background-color: #ffedd5; }
         .bg-avail { background-color: #dcfce7; }
         .bg-cm { background-color: #f3e8ff; }
-        .bg-visit { background-color: #fce7f3; }
+        .bg-sic { background-color: #fce7f3; }
 
         .text-danger { color: #ef4444; }
         .text-warning { color: #f59e0b; }
@@ -330,9 +330,9 @@
             },
             {
                 id: 'visit',
-                title: 'VISIT COUNT',
+                title: 'SIC',
                 groupClass: 'bg-pink-500 text-white',
-                subHeaderClass: 'bg-visit font-semibold',
+                subHeaderClass: 'bg-sic font-semibold',
                 targetLabel: 'Target (less 15%)'
             }
         ];
@@ -346,7 +346,7 @@
             { id: 'mttr', title: 'MTTR Performance\n(3 Hours)', color1: '#FFA500', color2: '#22c55e', isPercent: false },
             { id: 'availability', title: 'Availability Performance\n(' + availabilityChartCaption + ')', color1: '#008000', color2: '#3b82f6', isPercent: true },
             { id: 'cm', title: 'CM Count\n(<15%)', color1: '#800080', color2: '#eab308', isPercent: false },
-            { id: 'visit', title: 'Normal Visit\n(<15%)', color1: '#FFC0CB', color2: '#f43f5e', isPercent: false }
+            { id: 'visit', title: 'SIC\n(<15%)', color1: '#FFC0CB', color2: '#f43f5e', isPercent: false }
         ];
 
         function escapeAttr(value) {

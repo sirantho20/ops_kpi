@@ -86,17 +86,128 @@ def _pg_column_exists(cur, table: str, column: str) -> bool:
     return cur.fetchone() is not None
 
 
-def _ops_kpi_load_sql(*, has_ops_kpi_cm_count: bool) -> str:
+@dataclass(frozen=True)
+class OpsKpiSicColumns:
+    site_column: str
+    site_join_dimension: Literal["site_table_site_id", "kpi_site_id"]
+    date_column: str
+    value_column: str | None
+    value_mode: Literal["sum", "distinct_count", "row_count"] = "sum"
+
+
+def _sql_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _pg_public_columns(cur, table: str) -> set[str]:
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        """,
+        (table,),
+    )
+    return {str(row[0]) for row in cur.fetchall()}
+
+
+def _first_existing_column(columns: set[str], candidates: tuple[str, ...]) -> str | None:
+    lower_to_actual = {c.lower(): c for c in columns}
+    for candidate in candidates:
+        actual = lower_to_actual.get(candidate.lower())
+        if actual is not None:
+            return actual
+    return None
+
+
+def detect_ops_kpi_sic_columns(cur) -> OpsKpiSicColumns:
+    """Detect the SIC table shape and map it onto the dashboard site×date grain."""
+
+    columns = _pg_public_columns(cur, "ops_kpi_sic")
+    if not columns:
+        raise ValueError("Table public.ops_kpi_sic does not exist or has no columns.")
+
+    date_column = _first_existing_column(
+        columns,
+        (
+            "date",
+            "sic_date",
+            "event_date",
+            "report_date",
+            "created_date",
+            "outage_start",
+            "created_at",
+            "started_at",
+        ),
+    )
+    value_column = _first_existing_column(
+        columns,
+        ("sic_count", "sic", "sic_value", "count", "value", "total", "qty", "quantity"),
+    )
+    site_column = _first_existing_column(
+        columns,
+        ("site_id", "site", "kpi_site_id", "pla_id", "pla"),
+    )
+    value_mode: Literal["sum", "distinct_count", "row_count"] = "sum"
+    if value_column is None and "ticket_id" in {c.lower() for c in columns}:
+        value_column = _first_existing_column(columns, ("ticket_id",))
+        value_mode = "distinct_count"
+    elif value_column is None:
+        value_mode = "row_count"
+
+    if date_column is None or site_column is None:
+        raise ValueError(
+            "Table public.ops_kpi_sic must include recognizable site and date columns. "
+            "A SIC value column is optional when ticket rows can be counted. "
+            f"Detected columns: {', '.join(sorted(columns))}"
+        )
+
+    site_join_dimension: Literal["site_table_site_id", "kpi_site_id"]
+    if site_column.lower() in {"site_id", "site"}:
+        site_join_dimension = "site_table_site_id"
+    else:
+        site_join_dimension = "kpi_site_id"
+    return OpsKpiSicColumns(
+        site_column=site_column,
+        site_join_dimension=site_join_dimension,
+        date_column=date_column,
+        value_column=value_column,
+        value_mode=value_mode,
+    )
+
+
+def _ops_kpi_load_sql(*, has_ops_kpi_cm_count: bool, sic_columns: OpsKpiSicColumns) -> str:
     """Build site×date load SQL; CM inner metric uses ``cm_count`` column when present else row count."""
     cm_inner = (
         "COALESCE(e.cm_count, 0)::integer AS cm_row_value"
         if has_ops_kpi_cm_count
         else "1::integer AS cm_row_value"
     )
+    sic_site = _sql_ident(sic_columns.site_column)
+    sic_date = _sql_ident(sic_columns.date_column)
+    sic_value = _sql_ident(sic_columns.value_column) if sic_columns.value_column else None
+    if sic_columns.value_mode == "sum":
+        assert sic_value is not None
+        sic_count_expr = (
+            f"SUM(COALESCE(NULLIF(BTRIM(sic.{sic_value}::text), '')::numeric, 0))::integer"
+        )
+    elif sic_columns.value_mode == "distinct_count":
+        assert sic_value is not None
+        sic_count_expr = (
+            f"COUNT(DISTINCT NULLIF(BTRIM(sic.{sic_value}::text), ''))::integer"
+        )
+    else:
+        sic_count_expr = "COUNT(*)::integer"
+    sic_join_column = (
+        "sd.site_table_site_id"
+        if sic_columns.site_join_dimension == "site_table_site_id"
+        else "sd.kpi_site_id"
+    )
     return f"""
 -- Site-first dataset: every site across the dashboard date axis, with blank metrics when no
 -- matching availability fact row exists for (kpi_site_id, date).
--- Date axis includes any calendar day present in availability, CM, or site visits so FY table
+-- Date axis includes any calendar day present in availability, CM, or SIC so FY table
 -- totals include full-year facts. Charts use a fixed monthly axis from CHART_MONTH_START (Jan 2025)
 -- through the latest month present in loaded data.
 WITH site_dim AS (
@@ -129,7 +240,7 @@ date_dim AS (
         UNION
         SELECT e.event_date::date AS dt FROM ops_kpi_cm e WHERE e.event_date IS NOT NULL
         UNION
-        SELECT v.date::date AS dt FROM ops_kpi_sitevisit v
+        SELECT sic.{sic_date}::date AS dt FROM ops_kpi_sic sic WHERE sic.{sic_date} IS NOT NULL
     ) u
 ),
 cm_counts AS (
@@ -151,6 +262,16 @@ cm_counts AS (
         WHERE e.event_date IS NOT NULL
     ) mapped
     GROUP BY kpi_site_id, event_date
+),
+sic_counts AS (
+    SELECT
+        BTRIM(sic.{sic_site}::text) AS site_id,
+        sic.{sic_date}::date AS date,
+        {sic_count_expr} AS sic_count
+    FROM ops_kpi_sic sic
+    WHERE sic.{sic_date} IS NOT NULL
+      AND NULLIF(BTRIM(sic.{sic_site}::text), '') IS NOT NULL
+    GROUP BY BTRIM(sic.{sic_site}::text), sic.{sic_date}::date
 )
 SELECT
     COALESCE(a.site_id, sd.kpi_site_id) AS site_id,
@@ -168,7 +289,7 @@ SELECT
     a.availability AS "Availability",
     a.uptime_per_tenant AS "Uptime_per_tenant",
     a.total_available_minutes AS "Total Available Minutes",
-    COALESCE(v.visit_count, 0) AS "Visit Count",
+    COALESCE(sic.sic_count, 0) AS "SIC Count",
     COALESCE(c.cm_count, 0) AS "CM Count",
     COALESCE(NULLIF(BTRIM(a.zoo), ''), sd.site_zoo) AS "Zoo",
     sd.site_teritory AS site_teritory,
@@ -179,9 +300,9 @@ CROSS JOIN date_dim d
 LEFT JOIN ops_kpi_availability a
     ON a.site_id = sd.kpi_site_id
    AND a.date = d.date
-LEFT JOIN ops_kpi_sitevisit v
-    ON v.site_id = sd.site_table_site_id
-   AND v.date = d.date
+LEFT JOIN sic_counts sic
+    ON sic.site_id = {sic_join_column}
+   AND sic.date = d.date
 LEFT JOIN cm_counts c
     ON c.site_id = sd.kpi_site_id
    AND c.date = d.date
@@ -205,7 +326,7 @@ CSV_REQUIRED_COLUMNS = {
     "Availability",
     "Uptime_per_tenant",
     "Total Available Minutes",
-    "Visit Count",
+    "SIC Count",
     "CM Count",
     "Zoo",
 }
@@ -381,7 +502,13 @@ def load_daily_availability_from_database(database_url: str) -> pd.DataFrame:
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
             has_cm = _pg_column_exists(cur, "ops_kpi_cm", "cm_count")
-            cur.execute(_ops_kpi_load_sql(has_ops_kpi_cm_count=has_cm))
+            sic_columns = detect_ops_kpi_sic_columns(cur)
+            cur.execute(
+                _ops_kpi_load_sql(
+                    has_ops_kpi_cm_count=has_cm,
+                    sic_columns=sic_columns,
+                )
+            )
             rows = cur.fetchall()
             desc = cur.description
             columns = [
@@ -419,18 +546,20 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
                     cm_sig = f"{row[0] or 0}|{row[1] or ''}"
             except Exception:
                 pass
-            visit_sig = ""
+            sic_sig = ""
             try:
+                sic_columns = detect_ops_kpi_sic_columns(cur)
+                sic_date = _sql_ident(sic_columns.date_column)
                 cur.execute(
-                    "SELECT COUNT(*)::bigint, COALESCE(MAX(date)::text, '') FROM ops_kpi_sitevisit"
+                    f"SELECT COUNT(*)::bigint, COALESCE(MAX({sic_date})::text, '') FROM ops_kpi_sic"
                 )
                 row = cur.fetchone()
                 if row:
-                    visit_sig = f"{row[0] or 0}|{row[1] or ''}"
+                    sic_sig = f"{row[0] or 0}|{row[1] or ''}"
             except Exception:
                 pass
     max_s = max_date.isoformat() if max_date is not None else ""
-    return f"{count}|{max_s}|{tgt_sig}|{cm_sig}|sv={visit_sig}|cc={cm_col}"
+    return f"{count}|{max_s}|{tgt_sig}|{cm_sig}|sic={sic_sig}|cc={cm_col}"
 
 
 def ops_kpi_targets_revision(database_url: str) -> str:
@@ -478,7 +607,7 @@ def prepare_daily_availability_dataframe(
         "Availability",
         "Uptime_per_tenant",
         "Total Available Minutes",
-        "Visit Count",
+        "SIC Count",
         "CM Count",
     ]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -953,15 +1082,15 @@ def aggregate_cm_count(df: pd.DataFrame) -> int | None:
 
 
 def aggregate_visit_count(df: pd.DataFrame) -> int | None:
-    """Sum Normal Visit across every site×date row in ``df`` (chart series + monthly targets).
+    """Sum SIC across every site×date row in ``df`` (chart series + monthly targets).
 
-    Not filtered with ``_fact_rows_only``: a visit on a day without an ``ops_kpi_availability``
-    row still contributes, matching ``ops_kpi_sitevisit`` (+ site KPI key) rather than tying
-    visits to availability coverage (same rationale as ``aggregate_cm_count``).
+    Not filtered with ``_fact_rows_only``: SIC on a day without an ``ops_kpi_availability``
+    row still contributes, matching ``ops_kpi_sic`` (+ site KPI key) rather than tying
+    SIC to availability coverage (same rationale as ``aggregate_cm_count``).
     """
     if df.empty:
         return None
-    return int(df["Visit Count"].fillna(0).sum())
+    return int(df["SIC Count"].fillna(0).sum())
 
 
 def aggregate_event_count_table(df: pd.DataFrame) -> int | None:
@@ -973,11 +1102,11 @@ def aggregate_event_count_table(df: pd.DataFrame) -> int | None:
 
 
 def aggregate_visit_count_table(df: pd.DataFrame) -> int | None:
-    """Table totals: sum visits on every site×date row (not restricted to availability facts)."""
+    """Table totals: sum SIC on every site×date row (not restricted to availability facts)."""
 
     if df.empty:
         return None
-    return int(df["Visit Count"].fillna(0).sum())
+    return int(df["SIC Count"].fillna(0).sum())
 
 
 def aggregate_mttr_minutes(df: pd.DataFrame) -> float | None:

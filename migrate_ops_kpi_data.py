@@ -27,8 +27,8 @@ INSERT INTO ops_kpi_availability (
 )
 """
 
-INSERT_VISIT = """
-INSERT INTO ops_kpi_sitevisit (site_id, date, visit_count) VALUES (%s, %s, %s)
+INSERT_SIC = """
+INSERT INTO ops_kpi_sic (site_id, date, sic_count) VALUES (%s, %s, %s)
 """
 
 INSERT_CM = """
@@ -36,16 +36,16 @@ INSERT INTO ops_kpi_cm (site_id, date, cm_count) VALUES (%s, %s, %s)
 """
 
 # Map KPI keys (PLA when present, else site PK) to canonical site.site_id; merge duplicate keys.
-_NORMALIZE_SITEVISIT_UPDATE = """
-UPDATE ops_kpi_sitevisit v
+_NORMALIZE_SIC_UPDATE = """
+UPDATE ops_kpi_sic v
 SET site_id = s.site_id::text
 FROM site s
 WHERE v.site_id::text = COALESCE(NULLIF(BTRIM(s.pla_id::text), ''), s.site_id::text)
   AND v.site_id::text IS DISTINCT FROM s.site_id::text
 """
 
-_NORMALIZE_SITEVISIT_VIA_AVAIL_PTCI = """
-UPDATE ops_kpi_sitevisit v
+_NORMALIZE_SIC_VIA_AVAIL_PTCI = """
+UPDATE ops_kpi_sic v
 SET site_id = s.site_id::text
 FROM ops_kpi_availability a
 INNER JOIN site s ON s.site_id = NULLIF(BTRIM(a.ptci_number::text), '')
@@ -113,11 +113,11 @@ def build_rows_simple(df: pd.DataFrame) -> tuple[list, list, list]:
             _series_optional_float(df["Total Available Minutes"]),
         )
     )
-    vc = pd.to_numeric(df["Visit Count"], errors="coerce").fillna(0).astype(int)
+    sic = pd.to_numeric(df["SIC Count"], errors="coerce").fillna(0).astype(int)
     cc = pd.to_numeric(df["CM Count"], errors="coerce").fillna(0).astype(int)
-    visits = list(zip(site_ids.tolist(), days.tolist(), vc.tolist()))
+    sics = list(zip(site_ids.tolist(), days.tolist(), sic.tolist()))
     cms = list(zip(site_ids.tolist(), days.tolist(), cc.tolist()))
-    return avail, visits, cms
+    return avail, sics, cms
 
 
 def apply_schema(conn: psycopg.Connection) -> None:
@@ -137,39 +137,39 @@ def _executemany_batches(cur, sql: str, rows: list[tuple]) -> None:
         cur.executemany(sql, rows[i : i + _BATCH])
 
 
-def _normalize_ops_kpi_sitevisit(cur: psycopg.Cursor) -> None:
-    """Align sitevisit.site_id with public.site.site_id; collapse duplicate PKs with summed counts."""
-    cur.execute(_NORMALIZE_SITEVISIT_UPDATE)
-    cur.execute(_NORMALIZE_SITEVISIT_VIA_AVAIL_PTCI)
+def _normalize_ops_kpi_sic(cur: psycopg.Cursor) -> None:
+    """Align SIC site_id with public.site.site_id; collapse duplicate PKs with summed counts."""
+    cur.execute(_NORMALIZE_SIC_UPDATE)
+    cur.execute(_NORMALIZE_SIC_VIA_AVAIL_PTCI)
     cur.execute(
         """
-        CREATE TEMP TABLE _ops_kpi_sitevisit_merged AS
-        SELECT site_id, date, SUM(visit_count)::integer AS visit_count
-        FROM ops_kpi_sitevisit
+        CREATE TEMP TABLE _ops_kpi_sic_merged AS
+        SELECT site_id, date, SUM(sic_count)::integer AS sic_count
+        FROM ops_kpi_sic
         GROUP BY site_id, date
         """
     )
-    cur.execute("TRUNCATE ops_kpi_sitevisit")
+    cur.execute("TRUNCATE ops_kpi_sic")
     cur.execute(
         """
-        INSERT INTO ops_kpi_sitevisit (site_id, date, visit_count)
-        SELECT site_id, date, visit_count FROM _ops_kpi_sitevisit_merged
+        INSERT INTO ops_kpi_sic (site_id, date, sic_count)
+        SELECT site_id, date, sic_count FROM _ops_kpi_sic_merged
         """
     )
-    cur.execute("DROP TABLE _ops_kpi_sitevisit_merged")
+    cur.execute("DROP TABLE _ops_kpi_sic_merged")
 
 
 def migrate(conn: psycopg.Connection, df: pd.DataFrame) -> None:
-    avail, visits, cms = build_rows_simple(df)
+    avail, sics, cms = build_rows_simple(df)
     with conn.cursor() as cur:
-        # No FK from sitevisit/cm into availability; truncate all fact tables explicitly.
-        cur.execute("TRUNCATE ops_kpi_availability, ops_kpi_sitevisit, ops_kpi_cm")
+        # No FK from SIC/CM into availability; truncate all fact tables explicitly.
+        cur.execute("TRUNCATE ops_kpi_availability, ops_kpi_sic, ops_kpi_cm")
         _executemany_batches(cur, INSERT_AVAILABILITY, avail)
-        _executemany_batches(cur, INSERT_VISIT, visits)
-        _normalize_ops_kpi_sitevisit(cur)
+        _executemany_batches(cur, INSERT_SIC, sics)
+        _normalize_ops_kpi_sic(cur)
         _executemany_batches(cur, INSERT_CM, cms)
     conn.commit()
-    print(f"Inserted {len(avail)} availability, {len(visits)} sitevisit, {len(cms)} cm rows.")
+    print(f"Inserted {len(avail)} availability, {len(sics)} SIC, {len(cms)} cm rows.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,9 +213,9 @@ def main() -> None:
     print(f"Prepared {len(df)} rows from {csv_path}")
 
     if args.dry_run:
-        avail, visits, cms = build_rows_simple(df)
+        avail, sics, cms = build_rows_simple(df)
         print(
-            f"dry-run: {len(avail)} availability, {len(visits)} sitevisit, {len(cms)} cm rows"
+            f"dry-run: {len(avail)} availability, {len(sics)} SIC, {len(cms)} cm rows"
         )
         return
 

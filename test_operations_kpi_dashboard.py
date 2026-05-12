@@ -51,6 +51,18 @@ def fetch_json(url: str) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def fetch_error_text(url: str) -> tuple[int, str, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            return response.status, response.headers.get("Content-Type", ""), response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return (
+            exc.code,
+            exc.headers.get("Content-Type", ""),
+            exc.read().decode("utf-8"),
+        )
+
+
 class DashboardServerRoutesTests(unittest.TestCase):
     def test_healthz_returns_ok(self) -> None:
         with run_test_server() as base_url:
@@ -111,6 +123,52 @@ class DashboardServerRoutesTests(unittest.TestCase):
         self.assertEqual(exc_info.exception.code, 500)
         body = exc_info.exception.read().decode("utf-8")
         self.assertIn("private SQL detail", body)
+
+    def test_dashboard_route_returns_html_for_database_query_error(self) -> None:
+        with mock.patch.object(
+            dashboard,
+            "ops_kpi_data_fingerprint",
+            side_effect=dashboard.psycopg.ProgrammingError("relation missing"),
+        ):
+            with run_test_server(debug_errors=False) as base_url:
+                status, content_type, body = fetch_error_text(f"{base_url}/")
+
+        self.assertEqual(status, 503)
+        self.assertIn("text/html", content_type)
+        self.assertIn("database query failed", body)
+        self.assertIn("ops_kpi_sic", body)
+        self.assertNotIn("relation missing", body)
+
+    def test_dashboard_route_returns_html_for_sic_schema_error(self) -> None:
+        with mock.patch.object(dashboard, "ops_kpi_data_fingerprint", return_value="fp"):
+            with mock.patch.object(
+                dashboard,
+                "load_dashboard_payload",
+                side_effect=ValueError("Table public.ops_kpi_sic must include recognizable site and date columns."),
+            ):
+                with run_test_server(debug_errors=False) as base_url:
+                    status, content_type, body = fetch_error_text(f"{base_url}/")
+
+        self.assertEqual(status, 503)
+        self.assertIn("text/html", content_type)
+        self.assertIn("data shape", body)
+        self.assertIn("ops_kpi_sic", body)
+        self.assertNotIn("recognizable site and date", body)
+
+    def test_dashboard_route_debug_shows_sic_schema_error_detail(self) -> None:
+        detail = "Table public.ops_kpi_sic must include recognizable site and date columns."
+        with mock.patch.object(dashboard, "ops_kpi_data_fingerprint", return_value="fp"):
+            with mock.patch.object(
+                dashboard,
+                "load_dashboard_payload",
+                side_effect=ValueError(detail),
+            ):
+                with run_test_server(debug_errors=True) as base_url:
+                    status, content_type, body = fetch_error_text(f"{base_url}/")
+
+        self.assertEqual(status, 503)
+        self.assertIn("text/html", content_type)
+        self.assertIn(detail, body)
 
 
 if __name__ == "__main__":

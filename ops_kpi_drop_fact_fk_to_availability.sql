@@ -1,4 +1,4 @@
--- One-off migration: site-first visits/CM no longer require a matching ops_kpi_availability row.
+-- One-off migration: site-first SIC/CM no longer require a matching ops_kpi_availability row.
 -- Drops every foreign key that references ops_kpi_availability (safe to run multiple times).
 
 DO $$

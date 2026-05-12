@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dispatch-workbook",
         default="CM Dispatch Daily Distribution V2.xlsx",
-        help="Path to CM dispatch workbook used to enrich Visit Count and CM Count.",
+        help="Path to CM dispatch workbook used to enrich SIC Count and CM Count.",
     )
     parser.add_argument(
         "--zoo-mapping",
@@ -152,7 +152,7 @@ def main() -> None:
     )
     print(
         "Dispatch totals merged into output: "
-        f"Visit Count={int(enriched['Visit Count'].sum()):,}, "
+        f"SIC Count={int(enriched['SIC Count'].sum()):,}, "
         f"CM Count={int(enriched['CM Count'].sum()):,}"
     )
     mapped_zoo_sites = int(enriched.loc[enriched["Zoo"].notna(), "PTCI Number"].nunique())

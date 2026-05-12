@@ -154,7 +154,7 @@ def _target_explanation(
         b = aggregate_visit_count_table(scoped_df.loc[prev_mask])
         t = targets["visit"]
         return (
-            f"Target is {bf:.0%} of {prev_fy} visit count. "
+            f"Target is {bf:.0%} of {prev_fy} SIC count. "
             f"Baseline ({prev_fy}): {baseline_text(b)} → target: {format_value(t, kind='number')}."
         )
     if metric == "mttr":
@@ -343,7 +343,7 @@ def compute_cell_insight(
         col = {
             "events": "Incident_count",
             "cm": "CM Count",
-            "visit": "Visit Count",
+            "visit": "SIC Count",
         }[metric]
         top, other = _sum_metric_breakdown(period_df, col)
         result["top_contributors"] = top

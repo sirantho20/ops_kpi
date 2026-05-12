@@ -17,12 +17,11 @@ CREATE TABLE IF NOT EXISTS ops_kpi_availability (
     PRIMARY KEY (site_id, date)
 );
 
--- site_id is canonical public.site.site_id (not PLA). FK is added in ops_kpi_sitevisit_fk_to_site.sql
--- after public.site exists; greenfield DBs should run that migration once site is loaded.
-CREATE TABLE IF NOT EXISTS ops_kpi_sitevisit (
+-- site_id is canonical public.site.site_id (not PLA).
+CREATE TABLE IF NOT EXISTS ops_kpi_sic (
     site_id TEXT NOT NULL,
     date DATE NOT NULL,
-    visit_count INTEGER NOT NULL DEFAULT 0,
+    sic_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (site_id, date)
 );
 

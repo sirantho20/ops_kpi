@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 import psycopg
+import psycopg.errors
 
 from operations_kpi_data import (
     OpsKpiTargets,
@@ -35,6 +37,77 @@ DEFAULT_PORT = 8054
 DATA_PLACEHOLDER = "__DASHBOARD_DATA__"
 
 _analysis_cache: dict[str, tuple[str, object, dict, OpsKpiTargets]] = {}
+
+
+def _database_error_page(
+    *,
+    error_kind: str,
+    debug_detail: str | None = None,
+) -> bytes:
+    detail = ""
+    if debug_detail:
+        detail = f"<pre>{html.escape(debug_detail)}</pre>"
+    if error_kind == "permission":
+        title = "Operations KPI — database permission denied"
+        lead = (
+            "PostgreSQL accepted the connection, but the <code>DATABASE_URL</code> role "
+            "<strong>cannot read</strong> the KPI fact tables (for example <code>ops_kpi_availability</code>)."
+        )
+        bullets = (
+            "<li>Grant <code>USAGE</code> on the relevant schema and <code>SELECT</code> on "
+            "<code>ops_kpi_availability</code>, <code>ops_kpi_sic</code>, <code>ops_kpi_cm</code>, "
+            "<code>ops_kpi_targets</code>, and <code>site</code> (or use a role that already has them).</li>"
+            "<li>Retry after permissions are updated (no code change required).</li>"
+        )
+    elif error_kind == "schema":
+        title = "Operations KPI — data shape needs attention"
+        lead = (
+            "The dashboard connected to PostgreSQL, but the KPI data shape did not match "
+            "what the dashboard expects."
+        )
+        bullets = (
+            "<li>Check required tables and columns, especially <code>ops_kpi_sic</code>.</li>"
+            "<li>SIC needs a recognizable site column and date column; ticket-based tables "
+            "can be counted with <code>ticket_id</code>.</li>"
+            "<li>Restart or reload after the table shape is corrected.</li>"
+        )
+    elif error_kind == "query":
+        title = "Operations KPI — database query failed"
+        lead = (
+            "PostgreSQL accepted the connection, but a dashboard query failed while loading "
+            "the KPI payload."
+        )
+        bullets = (
+            "<li>Verify that required tables exist: <code>site</code>, "
+            "<code>ops_kpi_availability</code>, <code>ops_kpi_sic</code>, "
+            "<code>ops_kpi_cm</code>, and <code>ops_kpi_targets</code>.</li>"
+            "<li>Check that the live schema matches the dashboard loader expectations.</li>"
+        )
+    else:
+        title = "Operations KPI — database unavailable"
+        lead = (
+            "The HTTP server is running, but <strong>PostgreSQL could not be reached</strong> "
+            "using <code>DATABASE_URL</code>."
+        )
+        bullets = (
+            "<li>Ensure Postgres is running and accepting connections.</li>"
+            "<li>Set <code>DATABASE_URL</code> in <code>.env</code> or your environment.</li>"
+        )
+    page_html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><title>{html.escape(title)}</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:42rem;margin:2rem;line-height:1.5">
+<h1>Operations KPI Dashboard</h1>
+<p>{lead}</p>
+<ul>
+{bullets}
+<li>Process check: <a href="/healthz"><code>/healthz</code></a></li>
+<li>DB ping: <a href="/readyz"><code>/readyz</code></a></li>
+</ul>
+{detail}
+</body></html>"""
+    return page_html.encode("utf-8")
+
+
 _analysis_lock = threading.Lock()
 
 
@@ -77,7 +150,9 @@ def get_analysis_context(
 
 
 def parse_args() -> argparse.Namespace:
+    # Repo .env then CWD .env so DATABASE_URL resolves whether you launch from ~/ops_kpi or elsewhere.
     load_dotenv(ROOT / ".env")
+    load_dotenv()
     env_default_host = os.environ.get("OPERATIONS_KPI_HOST", DEFAULT_HOST)
     env_default_port = _env_int(
         "OPERATIONS_KPI_PORT",
@@ -256,6 +331,40 @@ def make_handler(
                 html = rendered_html(
                     data_fp, str(template_path.resolve()), st.st_mtime
                 )
+            except psycopg.Error as exc:  # pragma: no cover - database dependent
+                logger.exception("Dashboard unavailable: database error")
+                detail = self._error_message(exc, fallback="")
+                if isinstance(exc, psycopg.errors.InsufficientPrivilege):
+                    kind = "permission"
+                elif isinstance(exc, psycopg.OperationalError):
+                    kind = "connect"
+                else:
+                    kind = "query"
+                body = _database_error_page(
+                    error_kind=kind,
+                    debug_detail=detail if debug_errors else None,
+                )
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(body)
+                return
+            except ValueError as exc:
+                logger.exception("Dashboard unavailable: data shape error")
+                detail = self._error_message(exc, fallback="")
+                body = _database_error_page(
+                    error_kind="schema",
+                    debug_detail=detail if debug_errors else None,
+                )
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if send_body:
+                    self.wfile.write(body)
+                return
             except Exception as exc:  # pragma: no cover - surfaced in browser and console
                 logger.exception("Failed to render dashboard")
                 self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -348,7 +457,12 @@ def main() -> None:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         logger.error(
-            "DATABASE_URL is not set. Add it to .env or the environment (PostgreSQL connection string).",
+            "DATABASE_URL is not set. Add it to %s, a .env in your current directory, "
+            "or export DATABASE_URL (PostgreSQL connection string).",
+            ROOT / ".env",
+        )
+        logger.error(
+            "Without it the HTTP server never starts, so nothing will listen on the port.",
         )
         raise SystemExit(1)
     targets_database_url = database_url
@@ -373,6 +487,12 @@ def main() -> None:
     serve_thread.start()
 
     logger.info("Serving Operations KPI dashboard at http://%s:%s", args.host, args.port)
+    lo = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+    logger.info(
+        "Sanity check (no DB required): curl http://%s:%s/healthz",
+        lo,
+        args.port,
+    )
     logger.info("Data source: PostgreSQL (DATABASE_URL)")
     logger.info("HTML template: %s", template_path)
     if args.prewarm:
