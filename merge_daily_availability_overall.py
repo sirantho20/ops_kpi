@@ -40,6 +40,7 @@ LEGACY_COLUMNS = [
     "Outage_mins",
     "Uptime_per_tenant",
     "SIC Count",
+    "Site Visit Count",
     "CM Count",
     "Zoo",
 ]
@@ -168,6 +169,7 @@ def load_dispatch_metrics(
     )
     grouped["SIC Count"] = grouped["SIC Count"].fillna(0).astype(int)
     grouped["CM Count"] = grouped["CM Count"].fillna(0).astype(int)
+    grouped["Site Visit Count"] = 0
     return grouped
 
 
@@ -219,6 +221,12 @@ def merge_dispatch_metrics(
     merged = merged.drop(columns=["_dispatch_site_id", "Site ID"])
     merged["SIC Count"] = pd.to_numeric(merged["SIC Count"], errors="coerce").fillna(0).astype(int)
     merged["CM Count"] = pd.to_numeric(merged["CM Count"], errors="coerce").fillna(0).astype(int)
+    if "Site Visit Count" not in merged.columns:
+        merged["Site Visit Count"] = 0
+    else:
+        merged["Site Visit Count"] = (
+            pd.to_numeric(merged["Site Visit Count"], errors="coerce").fillna(0).astype(int)
+        )
     return merged
 
 

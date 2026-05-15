@@ -9,11 +9,13 @@ import psycopg
 from operations_kpi_data import (
     OpsKpiTargets,
     aggregate_availability_pct,
-    availability_pct_for_region_scope,
     aggregate_cm_count,
     aggregate_event_count_table,
     aggregate_mttr_minutes_table,
+    aggregate_site_visit_count_table,
     aggregate_visit_count_table,
+    availability_pct_for_region_scope,
+    build_visit_compact_periods,
     fetch_ops_kpi_metrics_for_date_range,
     fiscal_year_labels,
     format_value,
@@ -21,7 +23,7 @@ from operations_kpi_data import (
     scope_frame,
 )
 
-METRICS = frozenset({"events", "mttr", "availability", "cm", "visit"})
+METRICS = frozenset({"events", "mttr", "availability", "cm", "visit", "siteVisit"})
 ROW_KINDS = frozenset({"region", "zoo", "footer"})
 TOP_N = 15
 
@@ -31,6 +33,7 @@ _METRIC_COMPARE = {
     "availability": "lower_is_bad",
     "cm": "upper_is_bad",
     "visit": "upper_is_bad",
+    "siteVisit": "upper_is_bad",
 }
 
 
@@ -96,6 +99,7 @@ def _row_targets(
     baseline_events = aggregate_event_count_table(scoped_df.loc[mask])
     baseline_cm = aggregate_cm_count(scoped_df.loc[mask])
     baseline_visit = aggregate_visit_count_table(scoped_df.loc[mask])
+    baseline_site_visit = aggregate_site_visit_count_table(scoped_df.loc[mask])
     if row_kind == "footer":
         availability_target = ops_targets.availability_pct
     else:
@@ -116,6 +120,11 @@ def _row_targets(
         "visit": (
             baseline_visit * ops_targets.visit_baseline_factor
             if baseline_visit is not None
+            else None
+        ),
+        "siteVisit": (
+            baseline_site_visit * ops_targets.visit_baseline_factor
+            if baseline_site_visit is not None
             else None
         ),
     }
@@ -155,6 +164,14 @@ def _target_explanation(
         t = targets["visit"]
         return (
             f"Target is {bf:.0%} of {prev_fy} SIC count. "
+            f"Baseline ({prev_fy}): {baseline_text(b)} → target: {format_value(t, kind='number')}."
+        )
+    if metric == "siteVisit":
+        bf = ops_targets.visit_baseline_factor
+        b = aggregate_site_visit_count_table(scoped_df.loc[prev_mask])
+        t = targets["siteVisit"]
+        return (
+            f"Target is {bf:.0%} of {prev_fy} site visit count. "
             f"Baseline ({prev_fy}): {baseline_text(b)} → target: {format_value(t, kind='number')}."
         )
     if metric == "mttr":
@@ -241,7 +258,14 @@ def compute_cell_insight(
 ) -> dict[str, Any]:
     if metric not in METRICS:
         raise ValueError(f"Invalid metric: {metric}")
-    if period_key not in periods and period_key != "TARGET":
+
+    visit_compact = build_visit_compact_periods(df)
+    period_ok = (
+        period_key == "TARGET"
+        or period_key in periods
+        or (metric in ("visit", "siteVisit") and period_key in visit_compact)
+    )
+    if not period_ok:
         raise ValueError(f"Invalid period: {period_key}")
 
     scoped = resolve_scoped_df(df, row_kind, region, zoo)
@@ -276,12 +300,17 @@ def compute_cell_insight(
         )
         return result
 
-    period_mask = periods[period_key]
+    if period_key in periods:
+        period_mask = periods[period_key]
+    else:
+        period_mask = visit_compact[period_key]
     period_df = scoped.loc[period_mask].copy()
 
     sql_triple: tuple[int, float | None, float | None] | None = None
     if database_url and metric in ("events", "mttr", "availability"):
-        d0, d1 = period_date_range_for_insight(df, periods, period_key)
+        d0, d1 = period_date_range_for_insight(
+            df, periods, period_key, extra_periods=visit_compact
+        )
         if d0 is not None and d1 is not None:
             with psycopg.connect(database_url) as conn:
                 with conn.cursor() as cur:
@@ -307,6 +336,9 @@ def compute_cell_insight(
     elif metric == "visit":
         actual = aggregate_visit_count_table(period_df)
         target = targets["visit"]
+    elif metric == "siteVisit":
+        actual = aggregate_site_visit_count_table(period_df)
+        target = targets["siteVisit"]
     elif metric == "mttr":
         actual = (
             sql_triple[1]
@@ -339,11 +371,12 @@ def compute_cell_insight(
     )
     result["summary"] = f"Actual {av} vs target {tv} ({status}) for {period_key} — {scope_label}."
 
-    if metric in ("events", "cm", "visit"):
+    if metric in ("events", "cm", "visit", "siteVisit"):
         col = {
             "events": "Incident_count",
             "cm": "CM Count",
             "visit": "SIC Count",
+            "siteVisit": "Site Visit Count",
         }[metric]
         top, other = _sum_metric_breakdown(period_df, col)
         result["top_contributors"] = top

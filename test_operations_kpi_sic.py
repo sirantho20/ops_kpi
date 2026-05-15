@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import unittest
 
+import pandas as pd
+
 from operations_kpi_data import (
     OpsKpiSicColumns,
+    OpsKpiSiteVisitColumns,
+    VISIT_TABLE_TOTAL_PERIOD_KEY,
     _ops_kpi_load_sql,
+    build_visit_compact_periods,
     detect_ops_kpi_sic_columns,
 )
 
@@ -80,7 +85,30 @@ class OpsKpiSicSqlTests(unittest.TestCase):
         )
         self.assertIn("ops_kpi_sic", sql)
         self.assertIn('"SIC Count"', sql)
-        self.assertNotIn("ops_kpi_" + "site" + "visit", sql)
+        self.assertIn('"Site Visit Count"', sql)
+        self.assertIn("0::integer", sql)
+
+    def test_load_sql_includes_site_visit_when_configured(self) -> None:
+        sql = _ops_kpi_load_sql(
+            has_ops_kpi_cm_count=True,
+            sic_columns=OpsKpiSicColumns(
+                site_column="site_id",
+                site_join_dimension="site_table_site_id",
+                date_column="date",
+                value_column="sic_count",
+            ),
+            site_visit_columns=OpsKpiSiteVisitColumns(
+                table_name="ops_kpi_site_visit",
+                site_column="site_id",
+                site_join_dimension="site_table_site_id",
+                date_column="date",
+                value_column="visit_count",
+            ),
+        )
+        self.assertIn("site_visit_counts", sql)
+        self.assertIn('public."ops_kpi_site_visit"', sql)
+        self.assertIn("COALESCE(svc.site_visit_count", sql)
+        self.assertNotIn('0::integer AS "Site Visit Count"', sql)
 
     def test_load_sql_counts_distinct_ticket_ids(self) -> None:
         sql = _ops_kpi_load_sql(
@@ -93,8 +121,25 @@ class OpsKpiSicSqlTests(unittest.TestCase):
                 value_mode="distinct_count",
             ),
         )
-        self.assertIn('COUNT(DISTINCT NULLIF(BTRIM(sic."ticket_id"::text), \'\'))::integer AS sic_count', sql)
+        self.assertIn(
+            'COUNT(DISTINCT NULLIF(BTRIM(sic."ticket_id"::text), \'\'))::integer AS sic_count',
+            sql,
+        )
         self.assertIn('SELECT sic."outage_start"::date AS dt FROM ops_kpi_sic', sql)
+
+
+class VisitCompactPeriodTests(unittest.TestCase):
+    def test_total_equals_union_of_fy_masks(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2025-06-01", "2026-03-15", "2027-01-01", "2024-12-01"]
+                ),
+            }
+        )
+        p = build_visit_compact_periods(df)
+        combo = p["FY2025"] | p["FY2026"]
+        self.assertTrue((p[VISIT_TABLE_TOTAL_PERIOD_KEY] == combo).all())
 
 
 if __name__ == "__main__":

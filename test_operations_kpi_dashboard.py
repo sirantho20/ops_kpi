@@ -13,7 +13,9 @@ from unittest import mock
 
 from http.server import ThreadingHTTPServer
 
+import pandas as pd
 import operations_kpi_dashboard as dashboard
+import operations_kpi_data as data
 
 
 @contextlib.contextmanager
@@ -137,6 +139,7 @@ class DashboardServerRoutesTests(unittest.TestCase):
         self.assertIn("text/html", content_type)
         self.assertIn("database query failed", body)
         self.assertIn("ops_kpi_sic", body)
+        self.assertIn("ops_kpi_site_visit", body)
         self.assertNotIn("relation missing", body)
 
     def test_dashboard_route_returns_html_for_sic_schema_error(self) -> None:
@@ -169,6 +172,103 @@ class DashboardServerRoutesTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("text/html", content_type)
         self.assertIn(detail, body)
+
+
+class DashboardTemplateTests(unittest.TestCase):
+    def test_sic_is_table_only_not_chart_type(self) -> None:
+        template = dashboard.DEFAULT_TEMPLATE.read_text(encoding="utf-8")
+        metric_configs = template.split("const metricConfigs = [", 1)[1].split(
+            "];", 1
+        )[0]
+        chart_types = template.split("const chartTypes = [", 1)[1].split("];", 1)[0]
+
+        self.assertIn("id: 'visit'", metric_configs)
+        self.assertIn("title: 'SIC'", metric_configs)
+        self.assertNotIn("id: 'visit'", chart_types)
+        self.assertNotIn("SIC", chart_types)
+        self.assertIn("id: 'siteVisit'", chart_types)
+        self.assertIn("Site Visit Count", chart_types)
+        self.assertIn("grid-cols-5", template)
+        self.assertNotIn("grid-cols-4", template)
+
+
+class DashboardChartPayloadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        rows = []
+        for region in data.CHART_ROW_ORDER:
+            site_visit_by_date = {
+                "2025-01-01": 10 if region == "NCR" else 0,
+                "2025-02-01": 20 if region == "NCR" else 0,
+                "2026-01-01": 7 if region == "NCR" else 0,
+                "2026-02-01": 11 if region == "NCR" else 0,
+            }
+            for date_text, site_visit_count in site_visit_by_date.items():
+                date_value = pd.Timestamp(date_text)
+                rows.append(
+                    {
+                        "Date": date_value,
+                        "month_period": date_value.to_period("M"),
+                        "Region": region,
+                        "territory_chart_group": "Metro" if region == "NCR" else region,
+                        "Incident_count": 0,
+                        "CM Count": 0,
+                        "Site Visit Count": site_visit_count,
+                    }
+                )
+        self.df = pd.DataFrame(rows)
+        self.periods = {
+            "FY2025": self.df["Date"].dt.year == 2025,
+            "FY2026": self.df["Date"].dt.year == 2026,
+        }
+        self.month_periods = pd.period_range("2026-01", "2026-02", freq="M")
+        self.month_labels = ["Jan 2026", "Feb 2026"]
+        self.targets = data.default_ops_kpi_targets()
+
+    def test_build_charts_includes_site_visit_series(self) -> None:
+        charts = data.build_charts(
+            self.df,
+            self.periods,
+            self.targets,
+            events_month_periods=self.month_periods,
+            events_month_labels=self.month_labels,
+            events_actuals_by_scope={scope: [0, 0] for scope in data.CHART_ROW_ORDER},
+            mttr_actuals_by_scope={scope: [None, None] for scope in data.CHART_ROW_ORDER},
+            availability_actuals_by_scope={
+                scope: [None, None] for scope in data.CHART_ROW_ORDER
+            },
+        )
+
+        site_visit = charts["NCR"]["siteVisit"]
+        self.assertTrue(site_visit["available"])
+        self.assertEqual(site_visit["months"], self.month_labels)
+        self.assertEqual(site_visit["actual"], [7, 11])
+        self.assertEqual(site_visit["target"], [13, 13])
+
+    def test_build_territory_charts_includes_site_visit_series(self) -> None:
+        territory_order, territory_charts = data.build_territory_charts(
+            self.df,
+            self.periods,
+            self.targets,
+            events_month_periods=self.month_periods,
+            events_month_labels=self.month_labels,
+            events_actuals_by_territory={
+                territory: [0, 0]
+                for territory in self.df["territory_chart_group"].unique()
+            },
+            mttr_actuals_by_territory={
+                territory: [None, None]
+                for territory in self.df["territory_chart_group"].unique()
+            },
+            availability_actuals_by_territory={
+                territory: [None, None]
+                for territory in self.df["territory_chart_group"].unique()
+            },
+        )
+
+        self.assertIn("Metro", territory_order)
+        site_visit = territory_charts["Metro"]["siteVisit"]
+        self.assertEqual(site_visit["actual"], [7, 11])
+        self.assertEqual(site_visit["target"], [13, 13])
 
 
 if __name__ == "__main__":

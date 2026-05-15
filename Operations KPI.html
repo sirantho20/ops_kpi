@@ -329,6 +329,13 @@
                 targetLabel: 'Target (less 15%)'
             },
             {
+                id: 'siteVisit',
+                title: 'SITE VISIT',
+                groupClass: 'bg-teal-600 text-white',
+                subHeaderClass: 'bg-teal-100 font-semibold',
+                targetLabel: 'Target (less 15%)'
+            },
+            {
                 id: 'visit',
                 title: 'SIC',
                 groupClass: 'bg-pink-500 text-white',
@@ -337,7 +344,13 @@
             }
         ];
         const tableMetricOrder = metricConfigs.map((metricConfig) => metricConfig.id);
-        const periodOrder = dashboardData.meta.periodOrder || ['TARGET'];
+        const defaultPeriodOrder = dashboardData.meta.periodOrder || ['TARGET'];
+        const metricPeriodOrder = dashboardData.meta.metricPeriodOrder || {};
+
+        function periodsForMetric(metricKey) {
+            const ordered = metricPeriodOrder[metricKey];
+            return Array.isArray(ordered) && ordered.length ? ordered : defaultPeriodOrder;
+        }
         const chartRowOrder = ['Overall', 'NCR', 'NLZ', 'SLZ', 'VIS', 'MIN'];
         const chartRowOrderRegional = chartRowOrder.filter((r) => r !== 'Overall');
         const collapsedRegions = new Set();
@@ -346,7 +359,7 @@
             { id: 'mttr', title: 'MTTR Performance\n(3 Hours)', color1: '#FFA500', color2: '#22c55e', isPercent: false },
             { id: 'availability', title: 'Availability Performance\n(' + availabilityChartCaption + ')', color1: '#008000', color2: '#3b82f6', isPercent: true },
             { id: 'cm', title: 'CM Count\n(<15%)', color1: '#800080', color2: '#eab308', isPercent: false },
-            { id: 'visit', title: 'SIC\n(<15%)', color1: '#FFC0CB', color2: '#f43f5e', isPercent: false }
+            { id: 'siteVisit', title: 'Site Visit Count\n(<15%)', color1: '#0f766e', color2: '#14b8a6', isPercent: false }
         ];
 
         function escapeAttr(value) {
@@ -431,7 +444,13 @@
         }
 
         function periodHeaderLabel(periodKey, metricConfig) {
-            return periodKey === 'TARGET' ? metricConfig.targetLabel : periodKey;
+            if (periodKey === 'TARGET') {
+                return metricConfig.targetLabel;
+            }
+            if (periodKey === 'TOTAL') {
+                return 'Total';
+            }
+            return periodKey;
         }
 
         function renderTableHead() {
@@ -439,15 +458,16 @@
             const groupHeaders = metricConfigs
                 .map(
                     (metricConfig) => `
-                        <th colspan="${periodOrder.length}" class="table-cell table-header ${metricConfig.groupClass}">
+                        <th colspan="${periodsForMetric(metricConfig.id).length}" class="table-cell table-header ${metricConfig.groupClass}">
                             ${metricConfig.title}
                         </th>
                     `
                 )
                 .join('');
             const periodHeaders = metricConfigs
-                .map((metricConfig) =>
-                    periodOrder
+                .map((metricConfig) => {
+                    const po = periodsForMetric(metricConfig.id);
+                    return po
                         .map(
                             (periodKey) => `
                                 <th class="table-cell ${metricConfig.subHeaderClass}">
@@ -455,8 +475,8 @@
                                 </th>
                             `
                         )
-                        .join('')
-                )
+                        .join('');
+                })
                 .join('');
 
             tableHead.innerHTML = `
@@ -480,7 +500,7 @@
             html += buildLabelMarkup(row, cellClass);
             html += cellMarkup(row.siteCount, cellClass);
             tableMetricOrder.forEach((metricKey) => {
-                periodOrder.forEach((periodKey) => {
+                periodsForMetric(metricKey).forEach((periodKey) => {
                     html += metricCellMarkup(row[metricKey][periodKey], cellClass, row, metricKey, periodKey);
                 });
             });

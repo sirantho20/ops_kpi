@@ -55,7 +55,8 @@ def _database_error_page(
         )
         bullets = (
             "<li>Grant <code>USAGE</code> on the relevant schema and <code>SELECT</code> on "
-            "<code>ops_kpi_availability</code>, <code>ops_kpi_sic</code>, <code>ops_kpi_cm</code>, "
+            "<code>ops_kpi_availability</code>, <code>ops_kpi_sic</code>, "
+            "<code>ops_kpi_site_visit</code> (or configured alias), <code>ops_kpi_cm</code>, "
             "<code>ops_kpi_targets</code>, and <code>site</code> (or use a role that already has them).</li>"
             "<li>Retry after permissions are updated (no code change required).</li>"
         )
@@ -66,7 +67,8 @@ def _database_error_page(
             "what the dashboard expects."
         )
         bullets = (
-            "<li>Check required tables and columns, especially <code>ops_kpi_sic</code>.</li>"
+            "<li>Check required tables/columns for <code>ops_kpi_sic</code> and a site-visit "
+            "table (for example <code>ops_kpi_site_visit</code>; see loader discovery order).</li>"
             "<li>SIC needs a recognizable site column and date column; ticket-based tables "
             "can be counted with <code>ticket_id</code>.</li>"
             "<li>Restart or reload after the table shape is corrected.</li>"
@@ -79,7 +81,8 @@ def _database_error_page(
         )
         bullets = (
             "<li>Verify that required tables exist: <code>site</code>, "
-            "<code>ops_kpi_availability</code>, <code>ops_kpi_sic</code>, "
+            "<code>ops_kpi_availability</code>, <code>ops_kpi_sic</code>, a site-visit facts table "
+            "(e.g. <code>ops_kpi_site_visit</code>), "
             "<code>ops_kpi_cm</code>, and <code>ops_kpi_targets</code>.</li>"
             "<li>Check that the live schema matches the dashboard loader expectations.</li>"
         )

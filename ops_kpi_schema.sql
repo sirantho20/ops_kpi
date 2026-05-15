@@ -25,6 +25,13 @@ CREATE TABLE IF NOT EXISTS ops_kpi_sic (
     PRIMARY KEY (site_id, date)
 );
 
+CREATE TABLE IF NOT EXISTS ops_kpi_site_visit (
+    site_id TEXT NOT NULL,
+    date DATE NOT NULL,
+    visit_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (site_id, date)
+);
+
 CREATE TABLE IF NOT EXISTS ops_kpi_cm (
     site_id TEXT NOT NULL,
     date DATE NOT NULL,
