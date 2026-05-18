@@ -27,7 +27,12 @@ from operations_kpi_data import (
     load_ops_kpi_targets,
     ops_kpi_data_fingerprint,
 )
-from operations_kpi_insights import METRICS, ROW_KINDS, compute_cell_insight
+from operations_kpi_insights import (
+    METRICS,
+    ROW_KINDS,
+    build_cell_insight_csv,
+    compute_cell_insight,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -270,7 +275,9 @@ def make_handler(
                 status = HTTPStatus.SERVICE_UNAVAILABLE
             self._send_json(payload, status=status, send_body=send_body)
 
-        def _serve_cell_insight(self) -> None:
+        def _parse_cell_insight_query(
+            self,
+        ) -> tuple[str, str, str, str, str | None]:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query, keep_blank_values=True)
 
@@ -280,24 +287,39 @@ def make_handler(
                     return None
                 return vals[0] if vals[0] != "" else None
 
+            row_kind = first("rowKind")
+            region = first("region")
+            metric = first("metric")
+            period = first("period")
+            zoo = first("zoo")
+            if not row_kind or not region or not metric or not period:
+                raise ValueError(
+                    "Required query parameters: rowKind, region, metric, period"
+                )
+            if row_kind not in ROW_KINDS:
+                raise ValueError(f"Invalid rowKind: {row_kind}")
+            if metric not in METRICS:
+                raise ValueError(f"Invalid metric: {metric}")
+            if row_kind == "zoo" and not zoo:
+                raise ValueError("zoo is required when rowKind is zoo")
+            if row_kind != "zoo":
+                zoo = None
+            return row_kind, region, metric, period, zoo
+
+        def _send_csv(self, body: bytes, filename: str) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{filename}"',
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _serve_cell_insight(self) -> None:
             try:
-                row_kind = first("rowKind")
-                region = first("region")
-                metric = first("metric")
-                period = first("period")
-                zoo = first("zoo")
-                if not row_kind or not region or not metric or not period:
-                    raise ValueError(
-                        "Required query parameters: rowKind, region, metric, period"
-                    )
-                if row_kind not in ROW_KINDS:
-                    raise ValueError(f"Invalid rowKind: {row_kind}")
-                if metric not in METRICS:
-                    raise ValueError(f"Invalid metric: {metric}")
-                if row_kind == "zoo" and not zoo:
-                    raise ValueError("zoo is required when rowKind is zoo")
-                if row_kind != "zoo":
-                    zoo = None
+                row_kind, region, metric, period, zoo = self._parse_cell_insight_query()
                 df, periods, ops_targets = get_analysis_context(
                     database_url=database_url,
                     targets_database_url=targets_database_url,
@@ -318,6 +340,36 @@ def make_handler(
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             except Exception as exc:  # pragma: no cover
                 logger.exception("Unexpected cell insight failure")
+                self._send_json(
+                    {
+                        "error": self._error_message(
+                            exc, fallback="Internal server error"
+                        )
+                    },
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
+        def _serve_cell_insight_export(self) -> None:
+            try:
+                row_kind, region, metric, period, zoo = self._parse_cell_insight_query()
+                df, periods, _ops_targets = get_analysis_context(
+                    database_url=database_url,
+                    targets_database_url=targets_database_url,
+                )
+                body, filename = build_cell_insight_csv(
+                    df,
+                    periods,
+                    row_kind,
+                    region,
+                    zoo,
+                    metric,
+                    period,
+                )
+                self._send_csv(body, filename)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as exc:  # pragma: no cover
+                logger.exception("Unexpected cell insight export failure")
                 self._send_json(
                     {
                         "error": self._error_message(
@@ -400,6 +452,9 @@ def make_handler(
             if parsed.path == "/api/cell-insight":
                 self._serve_cell_insight()
                 return
+            if parsed.path == "/api/cell-insight/export":
+                self._serve_cell_insight_export()
+                return
             if parsed.path not in {"/", "/index.html"}:
                 self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
                 return
@@ -413,7 +468,7 @@ def make_handler(
             if parsed.path == "/readyz":
                 self._serve_readyz(send_body=False)
                 return
-            if parsed.path == "/api/cell-insight":
+            if parsed.path in {"/api/cell-insight", "/api/cell-insight/export"}:
                 self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
                 self.end_headers()
                 return

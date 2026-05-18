@@ -7,10 +7,15 @@ import pandas as pd
 from operations_kpi_data import (
     OpsKpiSicColumns,
     OpsKpiSiteVisitColumns,
+    VISIT_TABLE_FY_YEARS,
     VISIT_TABLE_TOTAL_PERIOD_KEY,
     _ops_kpi_load_sql,
+    build_meta,
+    build_table_row,
     build_visit_compact_periods,
+    default_ops_kpi_targets,
     detect_ops_kpi_sic_columns,
+    fy_key,
 )
 
 
@@ -126,6 +131,48 @@ class OpsKpiSicSqlTests(unittest.TestCase):
             sql,
         )
         self.assertIn('SELECT sic."outage_start"::date AS dt FROM ops_kpi_sic', sql)
+
+
+class SicTableTargetTests(unittest.TestCase):
+    def test_meta_visit_has_no_target_column_site_visit_keeps_it(self) -> None:
+        df = pd.DataFrame({"Date": pd.to_datetime(["2025-01-01", "2026-01-01"])})
+        periods = {
+            fy_key(2025): df["Date"].dt.year == 2025,
+            fy_key(2026): df["Date"].dt.year == 2026,
+        }
+        meta = build_meta(df, periods, default_ops_kpi_targets())
+        visit_order = meta["metricPeriodOrder"]["visit"]
+        site_visit_order = meta["metricPeriodOrder"]["siteVisit"]
+        self.assertNotIn("TARGET", visit_order)
+        self.assertEqual(site_visit_order[-1], "TARGET")
+        self.assertEqual(
+            visit_order,
+            [
+                fy_key(VISIT_TABLE_FY_YEARS[0]),
+                fy_key(VISIT_TABLE_FY_YEARS[1]),
+                VISIT_TABLE_TOTAL_PERIOD_KEY,
+            ],
+        )
+
+    def test_table_row_visit_has_no_target_cell(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2024-06-01", "2025-06-01", "2026-06-01"]),
+                "SIC Count": [1, 2, 3],
+                "CM Count": [0, 0, 0],
+                "Site Visit Count": [0, 0, 0],
+                "Incident_count": [0, 0, 0],
+                "Accepted Outage Minutes": [0, 0, 0],
+                "has_availability_row": [False, False, False],
+            }
+        )
+        periods = {
+            fy_key(2025): df["Date"].dt.year == 2025,
+            fy_key(2026): df["Date"].dt.year == 2026,
+        }
+        row = build_table_row(df, periods, default_ops_kpi_targets())
+        self.assertNotIn("TARGET", row["visit"])
+        self.assertIn("TARGET", row["siteVisit"])
 
 
 class VisitCompactPeriodTests(unittest.TestCase):

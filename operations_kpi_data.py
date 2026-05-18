@@ -992,11 +992,10 @@ def build_meta(
     df: pd.DataFrame, periods: dict[str, pd.Series], targets: OpsKpiTargets
 ) -> dict:
     full_order = [*periods.keys(), "TARGET"]
-    compact_visit = [
+    compact_visit_periods = [
         fy_key(VISIT_TABLE_FY_YEARS[0]),
         fy_key(VISIT_TABLE_FY_YEARS[1]),
         VISIT_TABLE_TOTAL_PERIOD_KEY,
-        "TARGET",
     ]
     return {
         "title": "Operations KPI Dashboard",
@@ -1009,8 +1008,8 @@ def build_meta(
             "mttr": full_order,
             "availability": full_order,
             "cm": full_order,
-            "visit": compact_visit,
-            "siteVisit": compact_visit,
+            "visit": compact_visit_periods,
+            "siteVisit": [*compact_visit_periods, "TARGET"],
         },
         "periodText": "",
         "limitations": [],
@@ -1132,12 +1131,6 @@ def build_table_row(
     cm_target = (
         baseline_cm * targets.cm_baseline_factor if baseline_cm is not None else None
     )
-    baseline_visit = aggregate_visit_count_table(scoped_df.loc[periods[previous_fy_label]])
-    visit_target = (
-        baseline_visit * targets.visit_baseline_factor
-        if baseline_visit is not None
-        else None
-    )
     baseline_site_visit = aggregate_site_visit_count_table(
         scoped_df.loc[periods[previous_fy_label]]
     )
@@ -1150,8 +1143,6 @@ def build_table_row(
         event_target = round(event_target)
     if cm_target is not None:
         cm_target = round(cm_target)
-    if visit_target is not None:
-        visit_target = round(visit_target)
     if site_visit_target is not None:
         site_visit_target = round(site_visit_target)
 
@@ -1207,9 +1198,10 @@ def build_table_row(
         ),
         "visit": build_metric_group(
             actuals=build_period_actuals(scoped_df, visit_periods, aggregate_visit_count_table),
-            target=visit_target,
+            target=None,
             kind="number",
             compare_mode="upper_is_bad",
+            include_target=False,
         ),
     }
 
@@ -1237,8 +1229,10 @@ def build_metric_group(
     target: float | int | None,
     kind: str,
     compare_mode: str,
+    *,
+    include_target: bool = True,
 ) -> dict:
-    comparison_target = target
+    comparison_target = target if include_target else None
     built = {}
     for period, value in actuals.items():
         class_name = ""
@@ -1249,7 +1243,8 @@ def build_metric_group(
                 class_name = "text-danger"
         built[period] = build_value_cell(value, kind=kind, class_name=class_name)
 
-    built["TARGET"] = build_value_cell(target, kind=kind)
+    if include_target:
+        built["TARGET"] = build_value_cell(target, kind=kind)
     return built
 
 

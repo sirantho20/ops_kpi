@@ -269,14 +269,26 @@
                 <h2 id="insight-modal-title" class="text-lg font-semibold text-slate-800">
                     Performance Insights
                 </h2>
-                <button
-                    type="button"
-                    id="insight-modal-dismiss"
-                    class="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                >
-                    <i class="fa-solid fa-xmark" aria-hidden="true"></i>
-                    Close
-                </button>
+                <div class="flex items-center gap-2">
+                    <button
+                        type="button"
+                        id="insight-modal-download"
+                        class="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-white"
+                        disabled
+                        title="Download row-level source data for this cell"
+                    >
+                        <i class="fa-solid fa-download" aria-hidden="true"></i>
+                        Download CSV
+                    </button>
+                    <button
+                        type="button"
+                        id="insight-modal-dismiss"
+                        class="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                    >
+                        <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                        Close
+                    </button>
+                </div>
             </div>
             <div class="overflow-y-auto p-4 flex-1 text-sm text-slate-700">
                 <div id="insight-modal-loading" class="hidden flex flex-col items-center justify-center gap-3 py-12 text-slate-600">
@@ -339,8 +351,7 @@
                 id: 'visit',
                 title: 'SIC',
                 groupClass: 'bg-pink-500 text-white',
-                subHeaderClass: 'bg-sic font-semibold',
-                targetLabel: 'Target (less 15%)'
+                subHeaderClass: 'bg-sic font-semibold'
             }
         ];
         const tableMetricOrder = metricConfigs.map((metricConfig) => metricConfig.id);
@@ -557,14 +568,24 @@
         const insightLoading = document.getElementById('insight-modal-loading');
         const insightContent = document.getElementById('insight-modal-content');
         const insightDismiss = document.getElementById('insight-modal-dismiss');
+        const insightDownload = document.getElementById('insight-modal-download');
         const insightBackdrop = document.getElementById('insight-modal-backdrop');
         let insightFocusBefore = null;
+        let lastInsightParams = null;
+
+        function setInsightDownloadEnabled(enabled, title) {
+            insightDownload.disabled = !enabled;
+            insightDownload.title =
+                title || 'Download row-level source data for this cell';
+        }
 
         function closeInsightModal() {
             insightModal.classList.add('hidden');
             insightLoading.classList.add('hidden');
             insightContent.classList.add('hidden');
             insightContent.innerHTML = '';
+            lastInsightParams = null;
+            setInsightDownloadEnabled(false);
             if (insightFocusBefore && typeof insightFocusBefore.focus === 'function') {
                 insightFocusBefore.focus();
             }
@@ -717,6 +738,8 @@
             insightLoading.classList.remove('hidden');
             insightContent.classList.add('hidden');
             insightContent.innerHTML = '';
+            lastInsightParams = null;
+            setInsightDownloadEnabled(false, 'Loading…');
             insightDismiss.focus();
 
             const params = new URLSearchParams({
@@ -728,23 +751,41 @@
             if (td.dataset.zoo) {
                 params.set('zoo', td.dataset.zoo);
             }
+            lastInsightParams = params;
 
             try {
                 const res = await fetch(`/api/cell-insight?${params.toString()}`);
                 const raw = await res.json();
                 if (!res.ok) {
                     insightContent.innerHTML = renderInsightHtml({ error: raw.error || res.statusText });
+                    setInsightDownloadEnabled(false, 'Insights could not be loaded');
                 } else {
                     insightContent.innerHTML = renderInsightHtml(raw);
+                    if (raw.period === 'TARGET') {
+                        setInsightDownloadEnabled(
+                            false,
+                            'Target cells have no underlying period data to export'
+                        );
+                    } else {
+                        setInsightDownloadEnabled(true);
+                    }
                 }
             } catch (err) {
                 insightContent.innerHTML = renderInsightHtml({
                     error: err && err.message ? err.message : 'Request failed'
                 });
+                setInsightDownloadEnabled(false, 'Insights could not be loaded');
             } finally {
                 insightLoading.classList.add('hidden');
                 insightContent.classList.remove('hidden');
             }
+        }
+
+        function downloadInsightCsv() {
+            if (!lastInsightParams || insightDownload.disabled) {
+                return;
+            }
+            window.location.href = `/api/cell-insight/export?${lastInsightParams.toString()}`;
         }
 
         function handleInsightClick(event) {
@@ -1012,6 +1053,7 @@
         document.getElementById('table-body').addEventListener('click', handleTableToggle);
         document.getElementById('data-table-section').addEventListener('click', handleInsightClick);
         insightDismiss.addEventListener('click', closeInsightModal);
+        insightDownload.addEventListener('click', downloadInsightCsv);
         insightBackdrop.addEventListener('click', closeInsightModal);
         document.addEventListener('keydown', (event) => {
             if (event.key === 'Escape' && !insightModal.classList.contains('hidden')) {

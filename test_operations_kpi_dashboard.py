@@ -16,6 +16,7 @@ from http.server import ThreadingHTTPServer
 import pandas as pd
 import operations_kpi_dashboard as dashboard
 import operations_kpi_data as data
+from test_operations_kpi_insights import _sample_df
 
 
 @contextlib.contextmanager
@@ -172,6 +173,59 @@ class DashboardServerRoutesTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("text/html", content_type)
         self.assertIn(detail, body)
+
+
+class CellInsightExportRouteTests(unittest.TestCase):
+    def test_export_returns_csv_attachment(self) -> None:
+        df = _sample_df()
+        periods = {
+            "Jun_25": (
+                (df["Date"] == pd.Timestamp("2025-06-01"))
+                | (df["Date"] == pd.Timestamp("2025-06-02"))
+            ),
+        }
+        targets = data.default_ops_kpi_targets()
+        with mock.patch.object(
+            dashboard,
+            "get_analysis_context",
+            return_value=(df, periods, targets),
+        ):
+            with run_test_server() as base_url:
+                url = (
+                    f"{base_url}/api/cell-insight/export?"
+                    "rowKind=region&region=NCR&metric=events&period=Jun_25"
+                )
+                with urllib.request.urlopen(url, timeout=3) as response:
+                    body = response.read().decode("utf-8")
+                    content_type = response.headers.get("Content-Type", "")
+                    disposition = response.headers.get("Content-Disposition", "")
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/csv", content_type)
+        self.assertIn("attachment", disposition)
+        self.assertIn("ops_kpi_events_NCR_Jun_25.csv", disposition)
+        self.assertIn("Date", body.splitlines()[0])
+        self.assertIn("Incident_count", body.splitlines()[0])
+        self.assertGreaterEqual(len(body.splitlines()), 3)
+
+    def test_export_target_returns_bad_request(self) -> None:
+        df = _sample_df()
+        periods = {"Jun_25": df["Date"].notna()}
+        targets = data.default_ops_kpi_targets()
+        with mock.patch.object(
+            dashboard,
+            "get_analysis_context",
+            return_value=(df, periods, targets),
+        ):
+            with run_test_server() as base_url:
+                url = (
+                    f"{base_url}/api/cell-insight/export?"
+                    "rowKind=region&region=NCR&metric=events&period=TARGET"
+                )
+                status, body = fetch_json(url)
+
+        self.assertEqual(status, 400)
+        self.assertIn("TARGET", body["error"])
 
 
 class DashboardTemplateTests(unittest.TestCase):

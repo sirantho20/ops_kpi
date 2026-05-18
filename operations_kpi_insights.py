@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
 import math
+import re
 from typing import Any
 
 import pandas as pd
 import psycopg
 
 from operations_kpi_data import (
+    CSV_REQUIRED_COLUMNS,
     OpsKpiTargets,
     aggregate_availability_pct,
     aggregate_cm_count,
@@ -35,6 +38,16 @@ _METRIC_COMPARE = {
     "visit": "upper_is_bad",
     "siteVisit": "upper_is_bad",
 }
+
+_EXPORT_DERIVED_COLUMNS = (
+    "ptci_site_id",
+    "availability_weight",
+    "availability_ratio",
+    "availability_fallback_ratio",
+    "month_period",
+)
+
+_FILENAME_UNSAFE = re.compile(r"[^\w.\-]+")
 
 
 def resolve_scoped_df(
@@ -231,6 +244,107 @@ def _availability_site_scores(period_df: pd.DataFrame) -> list[tuple[str, float,
     return rows
 
 
+def _validate_metric_period(
+    metric: str,
+    period_key: str,
+    periods: dict[str, pd.Series],
+    visit_compact: dict[str, pd.Series],
+) -> None:
+    if metric not in METRICS:
+        raise ValueError(f"Invalid metric: {metric}")
+    period_ok = (
+        period_key == "TARGET"
+        or period_key in periods
+        or (metric in ("visit", "siteVisit") and period_key in visit_compact)
+    )
+    if not period_ok:
+        raise ValueError(f"Invalid period: {period_key}")
+
+
+def resolve_cell_period_df(
+    df: pd.DataFrame,
+    periods: dict[str, pd.Series],
+    row_kind: str,
+    region: str,
+    zoo: str | None,
+    metric: str,
+    period_key: str,
+) -> pd.DataFrame:
+    """Scoped daily/site rows for the clicked cell (empty when period is TARGET)."""
+    visit_compact = build_visit_compact_periods(df)
+    _validate_metric_period(metric, period_key, periods, visit_compact)
+    if period_key == "TARGET":
+        return pd.DataFrame()
+    scoped = resolve_scoped_df(df, row_kind, region, zoo)
+    if period_key in periods:
+        period_mask = periods[period_key]
+    else:
+        period_mask = visit_compact[period_key]
+    return scoped.loc[period_mask].copy()
+
+
+def _export_columns(period_df: pd.DataFrame) -> list[str]:
+    ordered: list[str] = []
+    for col in CSV_REQUIRED_COLUMNS:
+        if col in period_df.columns:
+            ordered.append(col)
+    for col in _EXPORT_DERIVED_COLUMNS:
+        if col in period_df.columns and col not in ordered:
+            ordered.append(col)
+    return ordered
+
+
+def _slug_filename_part(value: str) -> str:
+    return _FILENAME_UNSAFE.sub("_", value.strip()) or "unknown"
+
+
+def cell_insight_export_filename(
+    *,
+    metric: str,
+    region: str,
+    period_key: str,
+    zoo: str | None = None,
+) -> str:
+    parts = ["ops_kpi", _slug_filename_part(metric), _slug_filename_part(region)]
+    if zoo:
+        parts.append(_slug_filename_part(zoo))
+    parts.append(_slug_filename_part(period_key))
+    return "_".join(parts) + ".csv"
+
+
+def build_cell_insight_csv(
+    df: pd.DataFrame,
+    periods: dict[str, pd.Series],
+    row_kind: str,
+    region: str,
+    zoo: str | None,
+    metric: str,
+    period_key: str,
+) -> tuple[bytes, str]:
+    if period_key == "TARGET":
+        raise ValueError("TARGET cells have no underlying period data to export")
+    period_df = resolve_cell_period_df(
+        df, periods, row_kind, region, zoo, metric, period_key
+    )
+    columns = _export_columns(period_df)
+    export_df = period_df[columns].copy() if columns else period_df.copy()
+    if "Date" in export_df.columns:
+        export_df["Date"] = pd.to_datetime(export_df["Date"], errors="coerce").dt.strftime(
+            "%Y-%m-%d"
+        )
+    if "month_period" in export_df.columns:
+        export_df["month_period"] = export_df["month_period"].astype(str)
+    buf = io.StringIO()
+    export_df.to_csv(buf, index=False)
+    filename = cell_insight_export_filename(
+        metric=metric,
+        region=region,
+        period_key=period_key,
+        zoo=zoo,
+    )
+    return buf.getvalue().encode("utf-8"), filename
+
+
 def _mttr_site_scores(period_df: pd.DataFrame) -> list[tuple[str, float, int]]:
     rows: list[tuple[str, float, int]] = []
     for pid, g in period_df.groupby("ptci_site_id", dropna=True):
@@ -256,17 +370,8 @@ def compute_cell_insight(
     *,
     database_url: str | None = None,
 ) -> dict[str, Any]:
-    if metric not in METRICS:
-        raise ValueError(f"Invalid metric: {metric}")
-
     visit_compact = build_visit_compact_periods(df)
-    period_ok = (
-        period_key == "TARGET"
-        or period_key in periods
-        or (metric in ("visit", "siteVisit") and period_key in visit_compact)
-    )
-    if not period_ok:
-        raise ValueError(f"Invalid period: {period_key}")
+    _validate_metric_period(metric, period_key, periods, visit_compact)
 
     scoped = resolve_scoped_df(df, row_kind, region, zoo)
     targets = _row_targets(
@@ -300,11 +405,9 @@ def compute_cell_insight(
         )
         return result
 
-    if period_key in periods:
-        period_mask = periods[period_key]
-    else:
-        period_mask = visit_compact[period_key]
-    period_df = scoped.loc[period_mask].copy()
+    period_df = resolve_cell_period_df(
+        df, periods, row_kind, region, zoo, metric, period_key
+    )
 
     sql_triple: tuple[int, float | None, float | None] | None = None
     if database_url and metric in ("events", "mttr", "availability"):
