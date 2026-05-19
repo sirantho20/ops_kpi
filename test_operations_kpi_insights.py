@@ -80,6 +80,37 @@ class ResolveCellPeriodDfTests(unittest.TestCase):
         )
         self.assertTrue(period_df.empty)
 
+    def test_site_visit_jan_26_resolves_rows(self) -> None:
+        df = self.df.copy()
+        jan_row = df.iloc[0].copy()
+        jan_row["Date"] = pd.Timestamp("2026-01-10")
+        jan_row["month_period"] = pd.Period("2026-01", freq="M")
+        jan_row["Site Visit Count"] = 5
+        df = pd.concat([df, pd.DataFrame([jan_row])], ignore_index=True)
+        period_df = insights.resolve_cell_period_df(
+            df,
+            self.periods,
+            "region",
+            "NCR",
+            None,
+            "siteVisit",
+            "JAN_26",
+        )
+        self.assertEqual(len(period_df), 1)
+        self.assertEqual(int(period_df.iloc[0]["Site Visit Count"]), 5)
+
+    def test_site_visit_rejects_total_period(self) -> None:
+        with self.assertRaises(ValueError):
+            insights.resolve_cell_period_df(
+                self.df,
+                self.periods,
+                "region",
+                "NCR",
+                None,
+                "siteVisit",
+                "TOTAL",
+            )
+
 
 class BuildCellInsightCsvTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -130,7 +161,6 @@ class BuildCellInsightCsvTests(unittest.TestCase):
                     "events",
                     "NotAPeriod",
                     self.periods,
-                    {},
                 )
         self.assertTrue(
             any("Invalid period" in line for line in captured.output)

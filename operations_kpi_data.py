@@ -131,6 +131,9 @@ SITE_VISIT_TABLE_CANDIDATES: tuple[str, ...] = (
 # Table columns shown for metrics ``visit`` (SIC) and ``siteVisit`` only.
 VISIT_TABLE_FY_YEARS: tuple[int, int] = (2025, 2026)
 VISIT_TABLE_TOTAL_PERIOD_KEY = "TOTAL"
+SITE_VISIT_TABLE_MONTH_PERIODS: tuple[pd.Period, ...] = tuple(
+    pd.Period(f"{VISIT_TABLE_FY_YEARS[1]}-{month:02d}", freq="M") for month in range(1, 4)
+)
 
 
 @dataclass(frozen=True)
@@ -1047,7 +1050,7 @@ def period_key(month_period: pd.Period) -> str:
 
 
 def build_visit_compact_periods(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """FY2025/FY2026 and their sum for the SIC and Site Visit table column groups."""
+    """FY2025/FY2026 and their sum for the SIC table column group."""
     y0, y1 = VISIT_TABLE_FY_YEARS
     m0 = df["Date"].dt.year == y0
     m1 = df["Date"].dt.year == y1
@@ -1056,6 +1059,27 @@ def build_visit_compact_periods(df: pd.DataFrame) -> dict[str, pd.Series]:
         fy_key(y1): m1,
         VISIT_TABLE_TOTAL_PERIOD_KEY: m0 | m1,
     }
+
+
+def build_site_visit_table_periods(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """FY years and Q1 monthly columns for the Site Visit table (no TOTAL)."""
+    y0, y1 = VISIT_TABLE_FY_YEARS
+    periods = {
+        fy_key(y0): df["Date"].dt.year == y0,
+        fy_key(y1): df["Date"].dt.year == y1,
+    }
+    for month_period in SITE_VISIT_TABLE_MONTH_PERIODS:
+        periods[period_key(month_period)] = df["month_period"] == month_period
+    return periods
+
+
+def site_visit_table_period_order() -> list[str]:
+    return [
+        fy_key(VISIT_TABLE_FY_YEARS[0]),
+        fy_key(VISIT_TABLE_FY_YEARS[1]),
+        *[period_key(month_period) for month_period in SITE_VISIT_TABLE_MONTH_PERIODS],
+        "TARGET",
+    ]
 
 
 def build_meta(
@@ -1079,7 +1103,7 @@ def build_meta(
             "availability": full_order,
             "cm": full_order,
             "visit": compact_visit_periods,
-            "siteVisit": [*compact_visit_periods, "TARGET"],
+            "siteVisit": site_visit_table_period_order(),
         },
         "periodText": "",
         "limitations": [],
@@ -1217,6 +1241,7 @@ def build_table_row(
         site_visit_target = round(site_visit_target)
 
     visit_periods = build_visit_compact_periods(scoped_df)
+    site_visit_periods = build_site_visit_table_periods(scoped_df)
     if ops_kpi_table_actuals is not None:
         ev_act = {p: ops_kpi_table_actuals[p][0] for p in periods}
         mttr_act = {p: ops_kpi_table_actuals[p][1] for p in periods}
@@ -1260,7 +1285,7 @@ def build_table_row(
         ),
         "siteVisit": build_metric_group(
             actuals=build_period_actuals(
-                scoped_df, visit_periods, aggregate_site_visit_count_table
+                scoped_df, site_visit_periods, aggregate_site_visit_count_table
             ),
             target=site_visit_target,
             kind="number",

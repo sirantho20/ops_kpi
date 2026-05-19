@@ -7,15 +7,19 @@ import pandas as pd
 from operations_kpi_data import (
     OpsKpiSicColumns,
     OpsKpiSiteVisitColumns,
+    SITE_VISIT_TABLE_MONTH_PERIODS,
     VISIT_TABLE_FY_YEARS,
     VISIT_TABLE_TOTAL_PERIOD_KEY,
     _ops_kpi_load_sql,
     build_meta,
+    build_site_visit_table_periods,
     build_table_row,
     build_visit_compact_periods,
     default_ops_kpi_targets,
     detect_ops_kpi_sic_columns,
     fy_key,
+    period_key,
+    site_visit_table_period_order,
 )
 
 
@@ -144,6 +148,8 @@ class SicTableTargetTests(unittest.TestCase):
         visit_order = meta["metricPeriodOrder"]["visit"]
         site_visit_order = meta["metricPeriodOrder"]["siteVisit"]
         self.assertNotIn("TARGET", visit_order)
+        self.assertNotIn(VISIT_TABLE_TOTAL_PERIOD_KEY, site_visit_order)
+        self.assertEqual(site_visit_order, site_visit_table_period_order())
         self.assertEqual(site_visit_order[-1], "TARGET")
         self.assertEqual(
             visit_order,
@@ -170,9 +176,34 @@ class SicTableTargetTests(unittest.TestCase):
             fy_key(2025): df["Date"].dt.year == 2025,
             fy_key(2026): df["Date"].dt.year == 2026,
         }
+        df["month_period"] = df["Date"].dt.to_period("M")
         row = build_table_row(df, periods, default_ops_kpi_targets())
         self.assertNotIn("TARGET", row["visit"])
+        self.assertNotIn(VISIT_TABLE_TOTAL_PERIOD_KEY, row["siteVisit"])
         self.assertIn("TARGET", row["siteVisit"])
+        for month_period in SITE_VISIT_TABLE_MONTH_PERIODS:
+            self.assertIn(period_key(month_period), row["siteVisit"])
+
+
+class SiteVisitTablePeriodTests(unittest.TestCase):
+    def test_site_visit_periods_have_fy_and_q1_months_no_total(self) -> None:
+        df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2025-06-01", "2026-01-15", "2026-02-20", "2026-03-10"]
+                ),
+            }
+        )
+        df["month_period"] = df["Date"].dt.to_period("M")
+        periods = build_site_visit_table_periods(df)
+        self.assertNotIn(VISIT_TABLE_TOTAL_PERIOD_KEY, periods)
+        self.assertIn(fy_key(2025), periods)
+        self.assertIn(fy_key(2026), periods)
+        for month_period in SITE_VISIT_TABLE_MONTH_PERIODS:
+            key = period_key(month_period)
+            self.assertIn(key, periods)
+            expected = df["month_period"] == month_period
+            self.assertTrue(periods[key].equals(expected))
 
 
 class VisitCompactPeriodTests(unittest.TestCase):

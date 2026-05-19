@@ -21,6 +21,7 @@ from operations_kpi_data import (
     aggregate_site_visit_count_table,
     aggregate_visit_count_table,
     availability_pct_for_region_scope,
+    build_site_visit_table_periods,
     build_visit_compact_periods,
     fetch_ops_kpi_metrics_for_date_range,
     fiscal_year_labels,
@@ -247,11 +248,19 @@ def _availability_site_scores(period_df: pd.DataFrame) -> list[tuple[str, float,
     return rows
 
 
+def _visit_metric_table_periods(df: pd.DataFrame, metric: str) -> dict[str, pd.Series]:
+    if metric == "visit":
+        return build_visit_compact_periods(df)
+    if metric == "siteVisit":
+        return build_site_visit_table_periods(df)
+    raise ValueError(f"Not a visit-table metric: {metric}")
+
+
 def _validate_metric_period(
     metric: str,
     period_key: str,
     periods: dict[str, pd.Series],
-    visit_compact: dict[str, pd.Series],
+    extra_table_periods: dict[str, pd.Series] | None = None,
 ) -> None:
     if metric not in METRICS:
         msg = f"Invalid metric: {metric}"
@@ -260,7 +269,9 @@ def _validate_metric_period(
     period_ok = (
         period_key == "TARGET"
         or period_key in periods
-        or (metric in ("visit", "siteVisit") and period_key in visit_compact)
+        or (
+            extra_table_periods is not None and period_key in extra_table_periods
+        )
     )
     if not period_ok:
         msg = f"Invalid period: {period_key}"
@@ -278,15 +289,17 @@ def resolve_cell_period_df(
     period_key: str,
 ) -> pd.DataFrame:
     """Scoped daily/site rows for the clicked cell (empty when period is TARGET)."""
-    visit_compact = build_visit_compact_periods(df)
-    _validate_metric_period(metric, period_key, periods, visit_compact)
+    extra_table_periods = None
+    if metric in ("visit", "siteVisit"):
+        extra_table_periods = _visit_metric_table_periods(df, metric)
+    _validate_metric_period(metric, period_key, periods, extra_table_periods)
     if period_key == "TARGET":
         return pd.DataFrame()
     scoped = resolve_scoped_df(df, row_kind, region, zoo)
     if period_key in periods:
         period_mask = periods[period_key]
     else:
-        period_mask = visit_compact[period_key]
+        period_mask = extra_table_periods[period_key]
     return scoped.loc[period_mask].copy()
 
 
@@ -392,8 +405,10 @@ def compute_cell_insight(
         period_key,
         zoo,
     )
-    visit_compact = build_visit_compact_periods(df)
-    _validate_metric_period(metric, period_key, periods, visit_compact)
+    extra_table_periods = None
+    if metric in ("visit", "siteVisit"):
+        extra_table_periods = _visit_metric_table_periods(df, metric)
+    _validate_metric_period(metric, period_key, periods, extra_table_periods)
 
     scoped = resolve_scoped_df(df, row_kind, region, zoo)
     logger.debug("compute_cell_insight: scoped_rows=%d", len(scoped))
@@ -436,7 +451,10 @@ def compute_cell_insight(
     sql_triple: tuple[int, float | None, float | None] | None = None
     if database_url and metric in ("events", "mttr", "availability"):
         d0, d1 = period_date_range_for_insight(
-            df, periods, period_key, extra_periods=visit_compact
+            df,
+            periods,
+            period_key,
+            extra_periods=extra_table_periods,
         )
         if d0 is not None and d1 is not None:
             with psycopg.connect(database_url) as conn:
