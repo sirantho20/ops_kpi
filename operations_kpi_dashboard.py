@@ -46,7 +46,40 @@ DATA_PLACEHOLDER = "__DASHBOARD_DATA__"
 
 _analysis_cache: dict[str, tuple[str, object, dict, OpsKpiTargets]] = {}
 
+_dashboard_warm = threading.Event()
+_last_render_fingerprint: dict[tuple[str, float], str] = {}
+_fingerprint_cache: tuple[float, str] | None = None
+_fingerprint_cache_lock = threading.Lock()
+
 _dashboard_logger = logging.getLogger("operations_kpi.dashboard")
+
+_LOADING_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>Operations KPI — loading</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+body{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;line-height:1.5;color:#0f172a}
+.spinner{display:inline-block;width:1.25rem;height:1.25rem;border:2px solid #cbd5e1;
+border-top-color:#2563eb;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:.5rem}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head>
+<body>
+<p><span class="spinner" aria-hidden="true"></span>Loading Operations KPI dashboard…</p>
+<p class="text-slate-600" style="color:#64748b;font-size:.9rem">
+First load can take several minutes while data is prepared from PostgreSQL.
+This page will refresh automatically when ready.
+</p>
+<script>
+(function poll(){
+  fetch('/readyz',{cache:'no-store'}).then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+    .then(function(x){
+      if(x.ok&&x.j&&x.j.status==='ready'){location.reload();return;}
+      setTimeout(poll,2000);
+    })
+    .catch(function(){setTimeout(poll,3000);});
+})();
+</script>
+</body></html>"""
 
 _request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "request_id", default=None
@@ -142,6 +175,55 @@ def _database_error_page(
 
 
 _analysis_lock = threading.Lock()
+
+
+def mark_dashboard_warm() -> None:
+    _dashboard_warm.set()
+
+
+def is_dashboard_warm() -> bool:
+    return _dashboard_warm.is_set()
+
+
+def reset_dashboard_warm_state() -> None:
+    """Clear warm/ fingerprint hints (tests)."""
+    _dashboard_warm.clear()
+    _last_render_fingerprint.clear()
+    global _fingerprint_cache
+    with _fingerprint_cache_lock:
+        _fingerprint_cache = None
+
+
+def _readyz_require_warm() -> bool:
+    return _env_flag(
+        "OPERATIONS_KPI_READYZ_REQUIRE_WARM",
+        default=_env_flag("OPERATIONS_KPI_PREWARM", default=True),
+    )
+
+
+def _serve_loading_until_warm() -> bool:
+    return _env_flag("OPERATIONS_KPI_SERVE_LOADING_UNTIL_WARM", default=True)
+
+
+def _fingerprint_cache_seconds() -> float:
+    return float(os.environ.get("OPERATIONS_KPI_FINGERPRINT_CACHE_SECONDS", "60"))
+
+
+def _cached_ops_kpi_data_fingerprint(database_url: str) -> str:
+    """Return data fingerprint; reuse recent value when render cache is warm."""
+    global _fingerprint_cache
+    ttl = _fingerprint_cache_seconds()
+    if ttl > 0 and is_dashboard_warm():
+        with _fingerprint_cache_lock:
+            if _fingerprint_cache is not None:
+                cached_at, cached_fp = _fingerprint_cache
+                if time.monotonic() - cached_at < ttl:
+                    return cached_fp
+    fp = ops_kpi_data_fingerprint(database_url)
+    if ttl > 0:
+        with _fingerprint_cache_lock:
+            _fingerprint_cache = (time.monotonic(), fp)
+    return fp
 
 
 def _env_int(name: str, default: int) -> int:
@@ -253,7 +335,13 @@ def make_handler(
     targets_database_url: str | None,
     debug_errors: bool,
     logger: logging.Logger,
+    require_warm_for_readyz: bool | None = None,
+    serve_loading_until_warm: bool | None = None,
 ):
+    if require_warm_for_readyz is None:
+        require_warm_for_readyz = _readyz_require_warm()
+    if serve_loading_until_warm is None:
+        serve_loading_until_warm = _serve_loading_until_warm()
     @lru_cache(maxsize=32)
     def _rendered_html_cached(
         data_fp: str, template_path_str: str, template_mtime: float
@@ -280,6 +368,36 @@ def make_handler(
             logger.debug("rendered_html cache hit fingerprint=%s", data_fp)
         elif info_after.misses > info_before.misses:
             logger.debug("rendered_html cache miss fingerprint=%s", data_fp)
+            mark_dashboard_warm()
+        return html_out
+
+    def resolve_dashboard_html() -> str:
+        path_str = str(template_path.resolve())
+        mtime = template_path.stat().st_mtime
+        cache_key = (path_str, mtime)
+        stored_fp = _last_render_fingerprint.get(cache_key)
+        if stored_fp is not None:
+            info_before = _rendered_html_cached.cache_info()
+            html_out = _rendered_html_cached(stored_fp, path_str, mtime)
+            if _rendered_html_cached.cache_info().hits > info_before.hits:
+                current_fp = _cached_ops_kpi_data_fingerprint(database_url)
+                if current_fp == stored_fp:
+                    logger.debug(
+                        "dashboard render cache hit; skipped full fingerprint round-trip"
+                    )
+                    return html_out
+                logger.info(
+                    "dashboard data changed (fingerprint %s -> %s); re-rendering",
+                    stored_fp[:48],
+                    current_fp[:48],
+                )
+                with _fingerprint_cache_lock:
+                    global _fingerprint_cache
+                    _fingerprint_cache = None
+        data_fp = _cached_ops_kpi_data_fingerprint(database_url)
+        html_out = rendered_html(data_fp, path_str, mtime)
+        _last_render_fingerprint[cache_key] = data_fp
+        mark_dashboard_warm()
         return html_out
 
     class DashboardHandler(BaseHTTPRequestHandler):
@@ -329,8 +447,6 @@ def make_handler(
                     with conn.cursor() as cur:
                         cur.execute("SELECT 1")
                         cur.fetchone()
-                payload = {"status": "ready"}
-                status = HTTPStatus.OK
             except Exception as exc:  # pragma: no cover - network/database dependent
                 logger.warning(
                     "Readiness check failed (%s): database=%s",
@@ -342,8 +458,42 @@ def make_handler(
                     "status": "not_ready",
                     "error": self._error_message(exc, fallback="Database unavailable"),
                 }
-                status = HTTPStatus.SERVICE_UNAVAILABLE
-            self._send_json(payload, status=status, send_body=send_body)
+                self._send_json(
+                    payload,
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    send_body=send_body,
+                )
+                return
+            if require_warm_for_readyz and not is_dashboard_warm():
+                self._send_json(
+                    {
+                        "status": "not_ready",
+                        "reason": "dashboard_cache_warming",
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    send_body=send_body,
+                )
+                return
+            self._send_json({"status": "ready"}, send_body=send_body)
+
+        def _is_internal_full_render(self) -> bool:
+            """Loopback or explicit pre-warm header may block on full dashboard render."""
+            if self.headers.get("X-Operations-Kpi-External-Client", "").strip() == "1":
+                return False
+            if self.headers.get("X-Operations-Kpi-Prewarm", "").strip() == "1":
+                return True
+            host = self.client_address[0] if self.client_address else ""
+            return host in {"127.0.0.1", "::1"}
+
+        def _serve_loading_page(self, send_body: bool) -> None:
+            body = _LOADING_PAGE_HTML.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if send_body:
+                self.wfile.write(body)
 
         def _parse_cell_insight_query(
             self,
@@ -451,14 +601,63 @@ def make_handler(
                     status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
+        def _serve_dashboard_payload_json(self) -> None:
+            try:
+                if require_warm_for_readyz and not is_dashboard_warm():
+                    self._send_json(
+                        {
+                            "status": "not_ready",
+                            "reason": "dashboard_cache_warming",
+                        },
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                payload = load_dashboard_payload(
+                    database_url,
+                    targets_database_url=targets_database_url,
+                )
+                self._send_json({"status": "ok", "data": payload})
+            except psycopg.Error as exc:  # pragma: no cover
+                self._send_json(
+                    {
+                        "status": "error",
+                        "error": self._error_message(
+                            exc, fallback="Database error"
+                        ),
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            except ValueError as exc:
+                self._send_json(
+                    {"status": "error", "error": str(exc)},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.exception("Unexpected dashboard payload failure")
+                self._send_json(
+                    {
+                        "status": "error",
+                        "error": self._error_message(
+                            exc, fallback="Internal server error"
+                        ),
+                    },
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
         def _serve_dashboard(self, send_body: bool) -> None:
+            if (
+                serve_loading_until_warm
+                and not is_dashboard_warm()
+                and not self._is_internal_full_render()
+            ):
+                logger.info(
+                    "Serving loading page (dashboard cache not warm yet; avoids proxy 504)"
+                )
+                self._serve_loading_page(send_body)
+                return
             t0 = time.perf_counter()
             try:
-                data_fp = ops_kpi_data_fingerprint(database_url)
-                st = template_path.stat()
-                html = rendered_html(
-                    data_fp, str(template_path.resolve()), st.st_mtime
-                )
+                html = resolve_dashboard_html()
             except psycopg.Error as exc:  # pragma: no cover - database dependent
                 if isinstance(exc, psycopg.errors.InsufficientPrivilege):
                     kind = "permission"
@@ -537,6 +736,9 @@ def make_handler(
             if parsed.path == "/api/cell-insight/export":
                 self._serve_cell_insight_export()
                 return
+            if parsed.path == "/api/dashboard-payload":
+                self._serve_dashboard_payload_json()
+                return
             if parsed.path not in {"/", "/index.html"}:
                 self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
                 return
@@ -580,12 +782,14 @@ def _prewarm_dashboard_cache(*, logger: logging.Logger, port: int) -> None:
     deadline_s = float(os.environ.get("OPERATIONS_KPI_PREWARM_TIMEOUT", "900"))
     url = f"http://127.0.0.1:{port}/"
     t0 = time.perf_counter()
+    req = urllib.request.Request(url, headers={"X-Operations-Kpi-Prewarm": "1"})
     try:
-        with urllib.request.urlopen(url, timeout=deadline_s) as resp:
+        with urllib.request.urlopen(req, timeout=deadline_s) as resp:
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
                     break
+        mark_dashboard_warm()
         logger.info(
             "Dashboard pre-warm finished in %.1fs; / should respond quickly for browsers now.",
             time.perf_counter() - t0,
@@ -643,6 +847,20 @@ def main() -> None:
     )
     logger.info("Data source: PostgreSQL (%s)", log_db_url_safe(database_url))
     logger.info("HTML template: %s", template_path)
+    if _readyz_require_warm():
+        logger.info(
+            "Readiness /readyz requires DB plus warm dashboard cache "
+            "(set OPERATIONS_KPI_READYZ_REQUIRE_WARM=false to only ping DB)."
+        )
+    if _serve_loading_until_warm():
+        logger.info(
+            "Cold GET / returns a fast loading page until the cache is warm "
+            "(set OPERATIONS_KPI_SERVE_LOADING_UNTIL_WARM=false to block on full render)."
+        )
+    logger.info(
+        "Proxy: increase proxy_read_timeout (see deploy/nginx-proxy-timeouts.conf); "
+        "use /healthz for liveness, /readyz for traffic."
+    )
     if args.prewarm:
         logger.info(
             "Pre-warming dashboard in the background (avoids a multi-minute blank wait on first / in the browser).",

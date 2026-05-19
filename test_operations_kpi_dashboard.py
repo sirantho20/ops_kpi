@@ -20,7 +20,13 @@ from test_operations_kpi_insights import _sample_df
 
 
 @contextlib.contextmanager
-def run_test_server(*, debug_errors: bool = False):
+def run_test_server(
+    *,
+    debug_errors: bool = False,
+    require_warm_for_readyz: bool = False,
+    serve_loading_until_warm: bool = False,
+):
+    dashboard.reset_dashboard_warm_state()
     with TemporaryDirectory() as temp_dir:
         template_path = Path(temp_dir) / "template.html"
         template_path.write_text(
@@ -33,6 +39,8 @@ def run_test_server(*, debug_errors: bool = False):
             targets_database_url=None,
             debug_errors=debug_errors,
             logger=logging.getLogger("test.operations_kpi_dashboard"),
+            require_warm_for_readyz=require_warm_for_readyz,
+            serve_loading_until_warm=serve_loading_until_warm,
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -105,6 +113,74 @@ class DashboardServerRoutesTests(unittest.TestCase):
         self.assertTrue(
             any("Readiness check failed" in line for line in captured.output)
         )
+
+    def test_readyz_not_ready_until_dashboard_warm(self) -> None:
+        connect_ctx = mock.MagicMock()
+        conn = mock.MagicMock()
+        cur = mock.MagicMock()
+        connect_ctx.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cur
+
+        with mock.patch.object(dashboard.psycopg, "connect", return_value=connect_ctx):
+            with run_test_server(require_warm_for_readyz=True) as base_url:
+                status, body = fetch_json(f"{base_url}/readyz")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(body["status"], "not_ready")
+        self.assertEqual(body["reason"], "dashboard_cache_warming")
+
+    def test_readyz_ready_when_db_ok_and_dashboard_warm(self) -> None:
+        connect_ctx = mock.MagicMock()
+        conn = mock.MagicMock()
+        cur = mock.MagicMock()
+        connect_ctx.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cur
+
+        with mock.patch.object(dashboard.psycopg, "connect", return_value=connect_ctx):
+            with run_test_server(require_warm_for_readyz=True) as base_url:
+                dashboard.mark_dashboard_warm()
+                status, body = fetch_json(f"{base_url}/readyz")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"status": "ready"})
+
+    def test_root_serves_loading_page_until_warm_for_external_clients(self) -> None:
+        with run_test_server(serve_loading_until_warm=True) as base_url:
+            req = urllib.request.Request(
+                f"{base_url}/",
+                headers={"X-Operations-Kpi-External-Client": "1"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as response:
+                body = response.read().decode("utf-8")
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("Loading Operations KPI", body)
+        self.assertIn("/readyz", body)
+
+    def test_root_loopback_still_renders_when_not_warm(self) -> None:
+        payload = {"meta": {}, "table": {"rows": [], "footer": {}}, "charts": {}}
+        with mock.patch.object(
+            dashboard,
+            "load_dashboard_payload",
+            return_value=payload,
+        ):
+            with mock.patch.object(
+                dashboard, "ops_kpi_data_fingerprint", return_value="fp1"
+            ):
+                with run_test_server(serve_loading_until_warm=True) as base_url:
+                    with urllib.request.urlopen(f"{base_url}/", timeout=3) as response:
+                        body = response.read().decode("utf-8")
+
+        self.assertEqual(response.status, 200)
+        self.assertIn('"meta"', body)
+        self.assertNotIn("Loading Operations KPI", body)
+
+    def test_dashboard_payload_api_not_ready_until_warm(self) -> None:
+        with run_test_server(require_warm_for_readyz=True) as base_url:
+            status, body = fetch_json(f"{base_url}/api/dashboard-payload")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(body["status"], "not_ready")
 
     def test_cell_insight_bad_row_kind_logs_warning(self) -> None:
         test_logger = logging.getLogger("test.operations_kpi_dashboard")

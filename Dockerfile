@@ -16,6 +16,8 @@ COPY ["operations_kpi_dashboard.py", "operations_kpi_data.py", "operations_kpi_i
 
 EXPOSE 8054
 
+# Liveness: /healthz (no DB). Readiness / traffic gate: /readyz (DB + warm cache when pre-warm on).
+# Reverse-proxy: use deploy/nginx-proxy-timeouts.conf — default 60s proxy_read_timeout causes 504 on /.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import os, sys, urllib.request; port = os.environ.get('OPERATIONS_KPI_PORT') or os.environ.get('PORT', '8054'); urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3); sys.exit(0)"
 
