@@ -89,17 +89,36 @@ class DashboardServerRoutesTests(unittest.TestCase):
         cur.execute.assert_called_once_with("SELECT 1")
 
     def test_readyz_hides_internal_error_when_db_ping_fails(self) -> None:
+        test_logger = logging.getLogger("test.operations_kpi_dashboard")
         with mock.patch.object(
             dashboard.psycopg,
             "connect",
             side_effect=RuntimeError("private connection details"),
         ):
-            with run_test_server() as base_url:
-                status, body = fetch_json(f"{base_url}/readyz")
+            with self.assertLogs(test_logger, level="WARNING") as captured:
+                with run_test_server() as base_url:
+                    status, body = fetch_json(f"{base_url}/readyz")
 
         self.assertEqual(status, 503)
         self.assertEqual(body["status"], "not_ready")
         self.assertEqual(body["error"], "Database unavailable")
+        self.assertTrue(
+            any("Readiness check failed" in line for line in captured.output)
+        )
+
+    def test_cell_insight_bad_row_kind_logs_warning(self) -> None:
+        test_logger = logging.getLogger("test.operations_kpi_dashboard")
+        with self.assertLogs(test_logger, level="WARNING") as captured:
+            with run_test_server() as base_url:
+                status, body = fetch_json(
+                    f"{base_url}/api/cell-insight?"
+                    "rowKind=invalid&region=NCR&metric=events&period=Jun_25"
+                )
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+        self.assertTrue(
+            any("cell insight bad request" in line.lower() for line in captured.output)
+        )
 
     def test_dashboard_route_hides_internal_error_when_debug_off(self) -> None:
         with mock.patch.object(

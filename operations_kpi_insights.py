@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
 import re
 from typing import Any
+
+logger = logging.getLogger("operations_kpi.insights")
 
 import pandas as pd
 import psycopg
@@ -251,14 +254,18 @@ def _validate_metric_period(
     visit_compact: dict[str, pd.Series],
 ) -> None:
     if metric not in METRICS:
-        raise ValueError(f"Invalid metric: {metric}")
+        msg = f"Invalid metric: {metric}"
+        logger.warning(msg)
+        raise ValueError(msg)
     period_ok = (
         period_key == "TARGET"
         or period_key in periods
         or (metric in ("visit", "siteVisit") and period_key in visit_compact)
     )
     if not period_ok:
-        raise ValueError(f"Invalid period: {period_key}")
+        msg = f"Invalid period: {period_key}"
+        logger.warning("%s (metric=%s)", msg, metric)
+        raise ValueError(msg)
 
 
 def resolve_cell_period_df(
@@ -322,7 +329,9 @@ def build_cell_insight_csv(
     period_key: str,
 ) -> tuple[bytes, str]:
     if period_key == "TARGET":
-        raise ValueError("TARGET cells have no underlying period data to export")
+        msg = "TARGET cells have no underlying period data to export"
+        logger.warning(msg)
+        raise ValueError(msg)
     period_df = resolve_cell_period_df(
         df, periods, row_kind, region, zoo, metric, period_key
     )
@@ -341,6 +350,11 @@ def build_cell_insight_csv(
         region=region,
         period_key=period_key,
         zoo=zoo,
+    )
+    logger.info(
+        "cell insight CSV export: filename=%s rows=%d",
+        filename,
+        len(export_df),
     )
     return buf.getvalue().encode("utf-8"), filename
 
@@ -370,10 +384,19 @@ def compute_cell_insight(
     *,
     database_url: str | None = None,
 ) -> dict[str, Any]:
+    logger.info(
+        "compute_cell_insight: row_kind=%s region=%r metric=%s period=%s zoo=%r",
+        row_kind,
+        region,
+        metric,
+        period_key,
+        zoo,
+    )
     visit_compact = build_visit_compact_periods(df)
     _validate_metric_period(metric, period_key, periods, visit_compact)
 
     scoped = resolve_scoped_df(df, row_kind, region, zoo)
+    logger.debug("compute_cell_insight: scoped_rows=%d", len(scoped))
     targets = _row_targets(
         scoped, periods, ops_targets, row_kind=row_kind, region=region
     )
@@ -408,6 +431,7 @@ def compute_cell_insight(
     period_df = resolve_cell_period_df(
         df, periods, row_kind, region, zoo, metric, period_key
     )
+    logger.debug("compute_cell_insight: period_rows=%d", len(period_df))
 
     sql_triple: tuple[int, float | None, float | None] | None = None
     if database_url and metric in ("events", "mttr", "availability"):

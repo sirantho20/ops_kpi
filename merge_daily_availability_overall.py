@@ -9,13 +9,17 @@ Phase 2: Merge with legacy daily_availability_transformed.csv, dedupe, write xls
 from __future__ import annotations
 
 import argparse
+import logging
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from operations_kpi_logging import add_log_level_arg, configure_logging, log_timing
 from transform_daily_availability_robust import transform_daily_availability
+
+logger = logging.getLogger("operations_kpi.etl.merge_daily_availability_overall")
 
 LEGACY_COLUMNS = [
     "PTCI Number",
@@ -81,7 +85,7 @@ def monthly_tabs_to_process(
 ) -> list[tuple[str, datetime]]:
     xl_path = Path(xl_path)
     xf = pd.ExcelFile(xl_path)
-    print(f"Workbook sheets ({len(xf.sheet_names)}): {xf.sheet_names}")
+    logger.debug("Workbook sheets (%d): %s", len(xf.sheet_names), xf.sheet_names)
 
     if tabs_override:
         ordered: list[tuple[str, datetime]] = []
@@ -298,9 +302,13 @@ def filter_rows_to_tab_month(
     n_drop = int((~mask).sum())
     if n_drop:
         extras = sorted(dates[~mask].dt.date.unique().tolist())
-        print(
-            f"WARNING: tab {tab!r}: dropping {n_drop} row(s) with Date outside "
-            f"{exp_y}-{exp_m:02d} (e.g. extra columns on sheet): {extras[:8]}{'...' if len(extras) > 8 else ''}"
+        logger.warning(
+            "tab %r: dropping %d row(s) with Date outside %d-%02d (e.g. extra columns on sheet): %s",
+            tab,
+            n_drop,
+            exp_y,
+            exp_m,
+            f"{extras[:8]}{'...' if len(extras) > 8 else ''}",
         )
     out = df.loc[mask].copy()
     out["Date"] = pd.to_datetime(out["Date"]).dt.normalize()
@@ -313,13 +321,13 @@ def transpose_all_sheets(
 ) -> pd.DataFrame:
     xl_path = Path(xl_path)
     tabs_meta = monthly_tabs_to_process(xl_path, tabs_override=tabs_override)
-    print("Tabs to process (chronological):")
+    logger.info("Tabs to process (chronological):")
     for tab, dt in tabs_meta:
-        print(f"  - {tab!r} -> {dt:%Y-%m}")
+        logger.info("  - %r -> %s", tab, dt.strftime("%Y-%m"))
 
     frames: list[pd.DataFrame] = []
     for tab, tab_dt in tabs_meta:
-        print(f"\n--- Transposing {tab!r} ---")
+        logger.info("Transposing %r", tab)
         raw = transform_daily_availability(
             str(xl_path),
             sheet_name=tab,
@@ -331,9 +339,11 @@ def transpose_all_sheets(
 
     overall = pd.concat(frames, ignore_index=True)
     overall["Date"] = pd.to_datetime(overall["Date"]).dt.normalize()
-    print(
-        f"\nOverall workbook Phase 1: {len(overall)} rows, "
-        f"Date {overall['Date'].min().date()} .. {overall['Date'].max().date()}"
+    logger.info(
+        "Overall workbook Phase 1: %d rows, Date %s .. %s",
+        len(overall),
+        overall["Date"].min().date(),
+        overall["Date"].max().date(),
     )
     return overall
 
@@ -350,7 +360,12 @@ def transpose_supplementary_workbooks(
     for path, tab_dt, label in entries:
         if not path.is_file():
             raise FileNotFoundError(f"Supplementary workbook not found: {path}")
-        print(f"\n--- Supplementary {label!r} ({path.name}) -> {tab_dt:%Y-%m} ---")
+        logger.info(
+            "Supplementary %r (%s) -> %s",
+            label,
+            path.name,
+            tab_dt.strftime("%Y-%m"),
+        )
         raw = transform_daily_availability(
             str(path),
             sheet_name=DAILY_SITE_AVAILABILITY_SHEET,
@@ -362,9 +377,11 @@ def transpose_supplementary_workbooks(
 
     out = pd.concat(frames, ignore_index=True)
     out["Date"] = pd.to_datetime(out["Date"]).dt.normalize()
-    print(
-        f"\nSupplementary workbooks: {len(out)} rows, "
-        f"Date {out['Date'].min().date()} .. {out['Date'].max().date()}"
+    logger.info(
+        "Supplementary workbooks: %d rows, Date %s .. %s",
+        len(out),
+        out["Date"].min().date(),
+        out["Date"].max().date(),
     )
     return out
 
@@ -380,9 +397,11 @@ def phase1_combined(
     weekly = transpose_supplementary_workbooks(supplementary_entries)
     combined = pd.concat([overall, weekly], ignore_index=True)
     combined["Date"] = pd.to_datetime(combined["Date"]).dt.normalize()
-    print(
-        f"\nPhase 1 combined: {len(combined)} rows, "
-        f"Date {combined['Date'].min().date()} .. {combined['Date'].max().date()}"
+    logger.info(
+        "Phase 1 combined: %d rows, Date %s .. %s",
+        len(combined),
+        combined["Date"].min().date(),
+        combined["Date"].max().date(),
     )
     return combined
 
@@ -485,7 +504,9 @@ def main() -> None:
         default="site_site.csv",
         help="Path to Zoo mapping CSV used to enrich the consolidated master data.",
     )
+    add_log_level_arg(p)
     args = p.parse_args()
+    configure_logging(args.log_level)
 
     root = Path(__file__).resolve().parent
     wb_path = root / args.workbook if not Path(args.workbook).is_absolute() else Path(args.workbook)
@@ -511,33 +532,49 @@ def main() -> None:
         (mar_p, datetime(2026, 3, 1), "March_2026_Weekly_Outage"),
     ]
 
-    combined = phase1_combined(wb_path, tabs_override, supplementary)
-    merged, n_dup = merge_with_legacy(combined, legacy_path)
-    merged = merge_dispatch_metrics(merged, dispatch_path)
-    merged = merge_zoo_mapping(merged, zoo_mapping_path)
+    try:
+        with log_timing(logger, "phase1_combined"):
+            combined = phase1_combined(wb_path, tabs_override, supplementary)
+        merged, n_dup = merge_with_legacy(combined, legacy_path)
+        merged = merge_dispatch_metrics(merged, dispatch_path)
+        merged = merge_zoo_mapping(merged, zoo_mapping_path)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("%s", exc)
+        raise SystemExit(1) from exc
+    except Exception:
+        logger.exception("Merge pipeline failed")
+        raise SystemExit(1) from None
 
-    print(f"\nPhase 2: removed {n_dup} duplicate key rows (PLA ID|PTCI Number + Date)")
-    print(
-        f"Merged shape: {len(merged)} rows, "
-        f"Date {merged['Date'].min().date()} .. {merged['Date'].max().date()}"
+    logger.info(
+        "Phase 2: removed %d duplicate key rows (PLA ID|PTCI Number + Date)",
+        n_dup,
     )
-    print(
-        "Dispatch totals merged into output: "
-        f"SIC Count={int(merged['SIC Count'].sum()):,}, "
-        f"CM Count={int(merged['CM Count'].sum()):,}"
+    logger.info(
+        "Merged shape: %d rows, Date %s .. %s",
+        len(merged),
+        merged["Date"].min().date(),
+        merged["Date"].max().date(),
+    )
+    logger.info(
+        "Dispatch totals merged into output: SIC Count=%s, CM Count=%s",
+        f"{int(merged['SIC Count'].sum()):,}",
+        f"{int(merged['CM Count'].sum()):,}",
     )
     mapped_zoo_sites = int(merged.loc[merged["Zoo"].notna(), "PTCI Number"].nunique())
-    print(f"Zoo coverage merged into output: {mapped_zoo_sites:,} mapped PTCI sites")
+    logger.info(
+        "Zoo coverage merged into output: %s mapped PTCI sites",
+        f"{mapped_zoo_sites:,}",
+    )
 
     out_df = merged.copy()
     out_df["Date"] = pd.to_datetime(out_df["Date"])
     out_df.to_excel(out_xlsx, index=False)
-    print(f"Wrote {out_xlsx}")
+    logger.info("Wrote %s", out_xlsx)
 
     if not args.no_csv:
         out_csv = root / args.output_csv if not Path(args.output_csv).is_absolute() else Path(args.output_csv)
         out_df.to_csv(out_csv, index=False)
-        print(f"Wrote {out_csv}")
+        logger.info("Wrote %s", out_csv)
 
 
 if __name__ == "__main__":

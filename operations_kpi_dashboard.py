@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import html
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 import threading
 import time
 import urllib.request
+import uuid
 from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +21,7 @@ from dotenv import load_dotenv
 import psycopg
 import psycopg.errors
 
+from operations_kpi_logging import configure_logging, log_db_url_safe
 from operations_kpi_data import (
     OpsKpiTargets,
     build_periods,
@@ -42,6 +45,28 @@ DEFAULT_PORT = 8054
 DATA_PLACEHOLDER = "__DASHBOARD_DATA__"
 
 _analysis_cache: dict[str, tuple[str, object, dict, OpsKpiTargets]] = {}
+
+_dashboard_logger = logging.getLogger("operations_kpi.dashboard")
+
+_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "request_id", default=None
+)
+_request_path: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "request_path", default=None
+)
+
+
+class _RequestContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        rid = _request_id.get()
+        path = _request_path.get()
+        if rid:
+            prefix = f"[req={rid}"
+            if path:
+                prefix += f" path={path}"
+            prefix += "] "
+            record.msg = prefix + str(record.msg)
+        return True
 
 
 def _database_error_page(
@@ -136,6 +161,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _default_listen_port() -> int:
+    """CapRover and similar platforms set PORT; prefer it over OPERATIONS_KPI_PORT."""
+    if os.environ.get("PORT") is not None:
+        return _env_int("PORT", DEFAULT_PORT)
+    return _env_int("OPERATIONS_KPI_PORT", DEFAULT_PORT)
+
+
 def get_analysis_context(
     *,
     database_url: str,
@@ -147,13 +179,24 @@ def get_analysis_context(
     with _analysis_lock:
         entry = _analysis_cache.get(key)
         if entry is not None and entry[0] == fp:
+            _dashboard_logger.debug("analysis context cache hit fingerprint=%s", fp)
             return entry[1], entry[2], entry[3]
+    _dashboard_logger.info(
+        "analysis context cache miss; loading from database fingerprint=%s",
+        fp,
+    )
+    t0 = time.perf_counter()
     df = load_daily_availability_from_database(database_url)
     periods = build_periods(df)
     tgt_url = targets_database_url if targets_database_url is not None else database_url
     targets = load_ops_kpi_targets(tgt_url)
     with _analysis_lock:
         _analysis_cache[key] = (fp, df, periods, targets)
+    _dashboard_logger.info(
+        "analysis context loaded in %.2fs rows=%d",
+        time.perf_counter() - t0,
+        len(df),
+    )
     return df, periods, targets
 
 
@@ -162,10 +205,7 @@ def parse_args() -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
     load_dotenv()
     env_default_host = os.environ.get("OPERATIONS_KPI_HOST", DEFAULT_HOST)
-    env_default_port = _env_int(
-        "OPERATIONS_KPI_PORT",
-        _env_int("PORT", DEFAULT_PORT),
-    )
+    env_default_port = _default_listen_port()
     parser = argparse.ArgumentParser(
         description="Serve the Operations KPI dashboard (PostgreSQL only)."
     )
@@ -215,7 +255,9 @@ def make_handler(
     logger: logging.Logger,
 ):
     @lru_cache(maxsize=32)
-    def rendered_html(data_fp: str, template_path_str: str, template_mtime: float) -> str:
+    def _rendered_html_cached(
+        data_fp: str, template_path_str: str, template_mtime: float
+    ) -> str:
         tpl = Path(template_path_str)
         html_template = tpl.read_text(encoding="utf-8")
         if DATA_PLACEHOLDER not in html_template:
@@ -230,7 +272,30 @@ def make_handler(
             DATA_PLACEHOLDER, json.dumps(payload, separators=(",", ":"))
         )
 
+    def rendered_html(data_fp: str, template_path_str: str, template_mtime: float) -> str:
+        info_before = _rendered_html_cached.cache_info()
+        html_out = _rendered_html_cached(data_fp, template_path_str, template_mtime)
+        info_after = _rendered_html_cached.cache_info()
+        if info_after.hits > info_before.hits:
+            logger.debug("rendered_html cache hit fingerprint=%s", data_fp)
+        elif info_after.misses > info_before.misses:
+            logger.debug("rendered_html cache miss fingerprint=%s", data_fp)
+        return html_out
+
     class DashboardHandler(BaseHTTPRequestHandler):
+        def _bind_request_context(self) -> tuple[contextvars.Token, contextvars.Token]:
+            rid = uuid.uuid4().hex[:8]
+            path = urlparse(self.path).path
+            return _request_id.set(rid), _request_path.set(path)
+
+        def _clear_request_context(
+            self,
+            token_id: contextvars.Token,
+            token_path: contextvars.Token,
+        ) -> None:
+            _request_id.reset(token_id)
+            _request_path.reset(token_path)
+
         def _error_message(self, exc: Exception, *, fallback: str) -> str:
             return str(exc) if debug_errors else fallback
 
@@ -267,7 +332,12 @@ def make_handler(
                 payload = {"status": "ready"}
                 status = HTTPStatus.OK
             except Exception as exc:  # pragma: no cover - network/database dependent
-                logger.exception("Readiness check failed")
+                logger.warning(
+                    "Readiness check failed (%s): database=%s",
+                    type(exc).__name__,
+                    log_db_url_safe(database_url),
+                    exc_info=True,
+                )
                 payload = {
                     "status": "not_ready",
                     "error": self._error_message(exc, fallback="Database unavailable"),
@@ -337,6 +407,7 @@ def make_handler(
                 )
                 self._send_json(payload)
             except ValueError as exc:
+                logger.warning("cell insight bad request: %s", exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             except Exception as exc:  # pragma: no cover
                 logger.exception("Unexpected cell insight failure")
@@ -367,6 +438,7 @@ def make_handler(
                 )
                 self._send_csv(body, filename)
             except ValueError as exc:
+                logger.warning("cell insight export bad request: %s", exc)
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             except Exception as exc:  # pragma: no cover
                 logger.exception("Unexpected cell insight export failure")
@@ -380,6 +452,7 @@ def make_handler(
                 )
 
         def _serve_dashboard(self, send_body: bool) -> None:
+            t0 = time.perf_counter()
             try:
                 data_fp = ops_kpi_data_fingerprint(database_url)
                 st = template_path.stat()
@@ -387,14 +460,18 @@ def make_handler(
                     data_fp, str(template_path.resolve()), st.st_mtime
                 )
             except psycopg.Error as exc:  # pragma: no cover - database dependent
-                logger.exception("Dashboard unavailable: database error")
-                detail = self._error_message(exc, fallback="")
                 if isinstance(exc, psycopg.errors.InsufficientPrivilege):
                     kind = "permission"
                 elif isinstance(exc, psycopg.OperationalError):
                     kind = "connect"
                 else:
                     kind = "query"
+                logger.error(
+                    "Dashboard unavailable: database error (kind=%s)",
+                    kind,
+                    exc_info=True,
+                )
+                detail = self._error_message(exc, fallback="")
                 body = _database_error_page(
                     error_kind=kind,
                     debug_detail=detail if debug_errors else None,
@@ -407,7 +484,7 @@ def make_handler(
                     self.wfile.write(body)
                 return
             except ValueError as exc:
-                logger.exception("Dashboard unavailable: data shape error")
+                logger.warning("Dashboard unavailable: data shape error: %s", exc)
                 detail = self._error_message(exc, fallback="")
                 body = _database_error_page(
                     error_kind="schema",
@@ -440,14 +517,19 @@ def make_handler(
             self.end_headers()
             if send_body:
                 self.wfile.write(body)
+            logger.info(
+                "Dashboard rendered in %.2fs (%d bytes)",
+                time.perf_counter() - t0,
+                len(body),
+            )
 
-        def do_GET(self) -> None:
+        def _handle_get(self, *, send_body: bool) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/healthz":
-                self._serve_healthz(send_body=True)
+                self._serve_healthz(send_body=send_body)
                 return
             if parsed.path == "/readyz":
-                self._serve_readyz(send_body=True)
+                self._serve_readyz(send_body=send_body)
                 return
             if parsed.path == "/api/cell-insight":
                 self._serve_cell_insight()
@@ -458,24 +540,33 @@ def make_handler(
             if parsed.path not in {"/", "/index.html"}:
                 self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
                 return
-            self._serve_dashboard(send_body=True)
+            self._serve_dashboard(send_body=send_body)
+
+        def do_GET(self) -> None:
+            token_id, token_path = self._bind_request_context()
+            t0 = time.perf_counter()
+            try:
+                self._handle_get(send_body=True)
+            finally:
+                logger.debug(
+                    "GET %s completed in %.2fs",
+                    self.path,
+                    time.perf_counter() - t0,
+                )
+                self._clear_request_context(token_id, token_path)
 
         def do_HEAD(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path == "/healthz":
-                self._serve_healthz(send_body=False)
-                return
-            if parsed.path == "/readyz":
-                self._serve_readyz(send_body=False)
-                return
-            if parsed.path in {"/api/cell-insight", "/api/cell-insight/export"}:
-                self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
-                self.end_headers()
-                return
-            if parsed.path not in {"/", "/index.html"}:
-                self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
-                return
-            self._serve_dashboard(send_body=False)
+            token_id, token_path = self._bind_request_context()
+            t0 = time.perf_counter()
+            try:
+                self._handle_get(send_body=False)
+            finally:
+                logger.debug(
+                    "HEAD %s completed in %.2fs",
+                    self.path,
+                    time.perf_counter() - t0,
+                )
+                self._clear_request_context(token_id, token_path)
 
         def log_message(self, format: str, *args) -> None:
             logger.info("%s - %s", self.address_string(), format % args)
@@ -507,11 +598,10 @@ def _prewarm_dashboard_cache(*, logger: logging.Logger, port: int) -> None:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
-    logger = logging.getLogger("operations_kpi_dashboard")
+    configure_logging(args.log_level)
+    logger = logging.getLogger("operations_kpi.dashboard")
+    if not any(isinstance(f, _RequestContextFilter) for f in logger.filters):
+        logger.addFilter(_RequestContextFilter())
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         logger.error(
@@ -551,7 +641,7 @@ def main() -> None:
         lo,
         args.port,
     )
-    logger.info("Data source: PostgreSQL (DATABASE_URL)")
+    logger.info("Data source: PostgreSQL (%s)", log_db_url_safe(database_url))
     logger.info("HTML template: %s", template_path)
     if args.prewarm:
         logger.info(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -11,6 +12,10 @@ from typing import Literal
 
 import pandas as pd
 import psycopg
+
+from operations_kpi_logging import log_timing
+
+logger = logging.getLogger("operations_kpi.data")
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,10 @@ def load_ops_kpi_targets(database_url: str | None) -> OpsKpiTargets:
                 cur.execute("SELECT metric_key, value FROM ops_kpi_targets")
                 rows = {str(k): float(v) for k, v in cur.fetchall()}
     except Exception:
+        logger.warning(
+            "Using default targets; could not load ops_kpi_targets",
+            exc_info=True,
+        )
         return d
     legacy = rows.get("baseline_factor")
     ev = rows.get("events_baseline_factor", legacy if legacy is not None else d.events_baseline_factor)
@@ -54,7 +63,7 @@ def load_ops_kpi_targets(database_url: str | None) -> OpsKpiTargets:
     mt = rows.get("mttr_minutes", d.mttr_minutes)
     ap = rows.get("availability_pct", d.availability_pct)
     ap_ncr = rows.get("availability_pct_ncr", d.availability_pct_ncr)
-    return OpsKpiTargets(
+    loaded = OpsKpiTargets(
         events_baseline_factor=float(ev),
         cm_baseline_factor=float(cm),
         visit_baseline_factor=float(vis),
@@ -62,6 +71,8 @@ def load_ops_kpi_targets(database_url: str | None) -> OpsKpiTargets:
         availability_pct=float(ap),
         availability_pct_ncr=float(ap_ncr),
     )
+    logger.info("Loaded ops_kpi_targets (%d metric keys from database)", len(rows))
+    return loaded
 
 
 def availability_pct_for_region_scope(region: str, targets: OpsKpiTargets) -> float:
@@ -163,6 +174,7 @@ def detect_ops_kpi_sic_columns(cur) -> OpsKpiSicColumns:
 
     columns = _pg_public_columns(cur, "ops_kpi_sic")
     if not columns:
+        logger.error("ops_kpi_sic: table missing or has no columns")
         raise ValueError("Table public.ops_kpi_sic does not exist or has no columns.")
 
     date_column = _first_existing_column(
@@ -194,24 +206,35 @@ def detect_ops_kpi_sic_columns(cur) -> OpsKpiSicColumns:
         value_mode = "row_count"
 
     if date_column is None or site_column is None:
-        raise ValueError(
+        msg = (
             "Table public.ops_kpi_sic must include recognizable site and date columns. "
             "A SIC value column is optional when ticket rows can be counted. "
             f"Detected columns: {', '.join(sorted(columns))}"
         )
+        logger.error("ops_kpi_sic schema validation failed: %s", msg)
+        raise ValueError(msg)
 
     site_join_dimension: Literal["site_table_site_id", "kpi_site_id"]
     if site_column.lower() in {"site_id", "site"}:
         site_join_dimension = "site_table_site_id"
     else:
         site_join_dimension = "kpi_site_id"
-    return OpsKpiSicColumns(
+    sic_cols = OpsKpiSicColumns(
         site_column=site_column,
         site_join_dimension=site_join_dimension,
         date_column=date_column,
         value_column=value_column,
         value_mode=value_mode,
     )
+    logger.info(
+        "ops_kpi_sic columns: site=%s date=%s value=%s mode=%s join=%s",
+        sic_cols.site_column,
+        sic_cols.date_column,
+        sic_cols.value_column,
+        sic_cols.value_mode,
+        sic_cols.site_join_dimension,
+    )
+    return sic_cols
 
 
 def detect_ops_kpi_site_visit_columns(cur) -> OpsKpiSiteVisitColumns:
@@ -220,10 +243,12 @@ def detect_ops_kpi_site_visit_columns(cur) -> OpsKpiSiteVisitColumns:
     last_detail = ""
     for table_name in SITE_VISIT_TABLE_CANDIDATES:
         if not _pg_table_exists(cur, table_name):
+            logger.debug("site visit candidate %s: table does not exist", table_name)
             continue
         columns = _pg_public_columns(cur, table_name)
         if not columns:
             last_detail = f"{table_name}: no columns"
+            logger.debug("site visit candidate %s: %s", table_name, last_detail)
             continue
 
         date_column = _first_existing_column(
@@ -268,6 +293,7 @@ def detect_ops_kpi_site_visit_columns(cur) -> OpsKpiSiteVisitColumns:
             last_detail = (
                 f"{table_name}: missing site/date (have {', '.join(sorted(columns))})"
             )
+            logger.debug("site visit candidate %s: %s", table_name, last_detail)
             continue
 
         site_join_dimension: Literal["site_table_site_id", "kpi_site_id"]
@@ -275,7 +301,7 @@ def detect_ops_kpi_site_visit_columns(cur) -> OpsKpiSiteVisitColumns:
             site_join_dimension = "site_table_site_id"
         else:
             site_join_dimension = "kpi_site_id"
-        return OpsKpiSiteVisitColumns(
+        sv_cols = OpsKpiSiteVisitColumns(
             table_name=table_name,
             site_column=site_column,
             site_join_dimension=site_join_dimension,
@@ -283,14 +309,26 @@ def detect_ops_kpi_site_visit_columns(cur) -> OpsKpiSiteVisitColumns:
             value_column=value_column,
             value_mode=value_mode,
         )
+        logger.info(
+            "site visit table %s: site=%s date=%s value=%s mode=%s join=%s",
+            sv_cols.table_name,
+            sv_cols.site_column,
+            sv_cols.date_column,
+            sv_cols.value_column,
+            sv_cols.value_mode,
+            sv_cols.site_join_dimension,
+        )
+        return sv_cols
 
-    raise ValueError(
+    msg = (
         "No recognizable site visit fact table in public schema. "
         "Expected one of: "
         + ", ".join(SITE_VISIT_TABLE_CANDIDATES)
         + ". "
         + (last_detail or "None of these tables exist.")
     )
+    logger.warning("site visit detection failed: %s", msg)
+    raise ValueError(msg)
 
 
 def _ops_kpi_load_sql(
@@ -580,14 +618,16 @@ def load_dashboard_payload(
     *,
     targets_database_url: str | None = None,
 ) -> dict:
-    df = load_daily_availability_from_database(database_url)
+    with log_timing(logger, "load_dashboard_payload.load_df"):
+        df = load_daily_availability_from_database(database_url)
     tgt_url = (
         targets_database_url
         if targets_database_url is not None
         else database_url
     )
     targets = load_ops_kpi_targets(tgt_url)
-    periods = build_periods(df)
+    with log_timing(logger, "load_dashboard_payload.build_periods", rows=len(df)):
+        periods = build_periods(df)
 
     grouping_col = (
         "territory_chart_group"
@@ -601,61 +641,63 @@ def load_dashboard_payload(
             if str(x).strip() != ""
         }
     )
-    with psycopg.connect(database_url) as conn:
-        with conn.cursor() as cur:
-            events_month_periods, events_month_labels = _chart_month_axes_for_payload(
-                df, cur
-            )
-            (
-                scope_outages,
-                scope_mttr,
-                scope_avail,
-                terr_outages,
-                terr_mttr,
-                terr_avail,
-            ) = fetch_monthly_charts_from_availability_only(
-                cur, events_month_periods, territory_order
-            )
-            ops_kpi_cubes = fetch_ops_kpi_availability_cubes(cur)
+    with log_timing(logger, "load_dashboard_payload.chart_sql"):
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                events_month_periods, events_month_labels = _chart_month_axes_for_payload(
+                    df, cur
+                )
+                (
+                    scope_outages,
+                    scope_mttr,
+                    scope_avail,
+                    terr_outages,
+                    terr_mttr,
+                    terr_avail,
+                ) = fetch_monthly_charts_from_availability_only(
+                    cur, events_month_periods, territory_order
+                )
+                ops_kpi_cubes = fetch_ops_kpi_availability_cubes(cur)
 
-    period_ops_index = build_period_ops_index(df, periods)
-    table_rows = build_table_rows(
-        df,
-        periods,
-        targets,
-        ops_kpi_cubes=ops_kpi_cubes,
-        period_ops_index=period_ops_index,
-    )
-    table_footer = build_table_row(
-        scope_frame(df, "Overall"),
-        periods,
-        targets,
-        label="TOTAL",
-        row_kind="footer",
-        region="Overall",
-        level=0,
-        sort_order=999999,
-        group_start=False,
-        group_end=True,
-        ops_kpi_table_actuals=table_ops_actuals_for_row(
-            ops_kpi_cubes,
-            period_ops_index,
+    with log_timing(logger, "load_dashboard_payload.build_table"):
+        period_ops_index = build_period_ops_index(df, periods)
+        table_rows = build_table_rows(
+            df,
+            periods,
+            targets,
+            ops_kpi_cubes=ops_kpi_cubes,
+            period_ops_index=period_ops_index,
+        )
+        table_footer = build_table_row(
+            scope_frame(df, "Overall"),
+            periods,
+            targets,
+            label="TOTAL",
             row_kind="footer",
             region="Overall",
-            zoo=None,
-        ),
-    )
+            level=0,
+            sort_order=999999,
+            group_start=False,
+            group_end=True,
+            ops_kpi_table_actuals=table_ops_actuals_for_row(
+                ops_kpi_cubes,
+                period_ops_index,
+                row_kind="footer",
+                region="Overall",
+                zoo=None,
+            ),
+        )
 
-    territory_order, territory_charts = build_territory_charts(
-        df,
-        periods,
-        targets,
-        events_month_periods=events_month_periods,
-        events_month_labels=events_month_labels,
-        events_actuals_by_territory=terr_outages,
-        mttr_actuals_by_territory=terr_mttr,
-        availability_actuals_by_territory=terr_avail,
-    )
+        territory_order, territory_charts = build_territory_charts(
+            df,
+            periods,
+            targets,
+            events_month_periods=events_month_periods,
+            events_month_labels=events_month_labels,
+            events_actuals_by_territory=terr_outages,
+            mttr_actuals_by_territory=terr_mttr,
+            availability_actuals_by_territory=terr_avail,
+        )
 
     return {
         "meta": build_meta(df, periods, targets),
@@ -679,26 +721,37 @@ def load_dashboard_payload(
 
 
 def load_daily_availability_from_database(database_url: str) -> pd.DataFrame:
-    with psycopg.connect(database_url) as conn:
-        with conn.cursor() as cur:
-            has_cm = _pg_column_exists(cur, "ops_kpi_cm", "cm_count")
-            sic_columns = detect_ops_kpi_sic_columns(cur)
-            sv_columns = detect_ops_kpi_site_visit_columns(cur)
-            cur.execute(
-                _ops_kpi_load_sql(
-                    has_ops_kpi_cm_count=has_cm,
-                    sic_columns=sic_columns,
-                    site_visit_columns=sv_columns,
+    with log_timing(logger, "load_daily_availability_from_database"):
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                has_cm = _pg_column_exists(cur, "ops_kpi_cm", "cm_count")
+                sic_columns = detect_ops_kpi_sic_columns(cur)
+                sv_columns = detect_ops_kpi_site_visit_columns(cur)
+                cur.execute(
+                    _ops_kpi_load_sql(
+                        has_ops_kpi_cm_count=has_cm,
+                        sic_columns=sic_columns,
+                        site_visit_columns=sv_columns,
+                    )
                 )
-            )
-            rows = cur.fetchall()
-            desc = cur.description
-            columns = [
-                getattr(d, "name", None) or (d[0] if d else "")
-                for d in (desc or [])
-            ]
-    df = pd.DataFrame(rows, columns=columns)
-    return prepare_daily_availability_dataframe(df, territory_source="frame")
+                rows = cur.fetchall()
+                desc = cur.description
+                columns = [
+                    getattr(d, "name", None) or (d[0] if d else "")
+                    for d in (desc or [])
+                ]
+        df = pd.DataFrame(rows, columns=columns)
+        prepared = prepare_daily_availability_dataframe(df, territory_source="frame")
+    date_min = prepared["Date"].min() if "Date" in prepared.columns and len(prepared) else None
+    date_max = prepared["Date"].max() if "Date" in prepared.columns and len(prepared) else None
+    logger.info(
+        "Loaded daily availability: rows=%d has_cm_count_column=%s date_range=%s..%s",
+        len(prepared),
+        has_cm,
+        date_min,
+        date_max,
+    )
+    return prepared
 
 
 def ops_kpi_data_fingerprint(database_url: str) -> str:
@@ -717,7 +770,10 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
                 if row:
                     tgt_sig = row[0] or ""
             except Exception:
-                pass
+                logger.warning(
+                    "fingerprint: ops_kpi_targets revision query failed",
+                    exc_info=True,
+                )
             cm_sig = ""
             try:
                 cur.execute(
@@ -727,7 +783,10 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
                 if row:
                     cm_sig = f"{row[0] or 0}|{row[1] or ''}"
             except Exception:
-                pass
+                logger.warning(
+                    "fingerprint: ops_kpi_cm stats query failed",
+                    exc_info=True,
+                )
             sic_sig = ""
             try:
                 sic_columns = detect_ops_kpi_sic_columns(cur)
@@ -739,7 +798,10 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
                 if row:
                     sic_sig = f"{row[0] or 0}|{row[1] or ''}"
             except Exception:
-                pass
+                logger.warning(
+                    "fingerprint: ops_kpi_sic stats query failed",
+                    exc_info=True,
+                )
             sv_sig = ""
             try:
                 sv_columns = detect_ops_kpi_site_visit_columns(cur)
@@ -753,7 +815,10 @@ def ops_kpi_data_fingerprint(database_url: str) -> str:
                 if row:
                     sv_sig = f"{sv_columns.table_name}|{row[0] or 0}|{row[1] or ''}"
             except Exception:
-                pass
+                logger.warning(
+                    "fingerprint: site visit stats query failed",
+                    exc_info=True,
+                )
     max_s = max_date.isoformat() if max_date is not None else ""
     return f"{count}|{max_s}|{tgt_sig}|{cm_sig}|sic={sic_sig}|sv={sv_sig}|cc={cm_col}"
 
@@ -769,6 +834,10 @@ def ops_kpi_targets_revision(database_url: str) -> str:
                 row = cur.fetchone()
                 return (row[0] or "") if row else ""
     except Exception:
+        logger.warning(
+            "ops_kpi_targets_revision query failed",
+            exc_info=True,
+        )
         return ""
 
 
@@ -784,10 +853,11 @@ def prepare_daily_availability_dataframe(
 
     missing_columns = sorted(CSV_REQUIRED_COLUMNS.difference(data.columns))
     if missing_columns:
-        raise ValueError(
-            "Data is missing required columns: " + ", ".join(missing_columns)
-        )
+        msg = "Data is missing required columns: " + ", ".join(missing_columns)
+        logger.error("%s (territory_source=%s)", msg, territory_source)
+        raise ValueError(msg)
 
+    logger.debug("prepare_daily_availability_dataframe territory_source=%s", territory_source)
     df = data.copy()
 
     def _norm_text_or_blank(v: object) -> str:
@@ -1845,9 +1915,25 @@ def fetch_ops_kpi_metrics_for_date_range(
     )
     row = cur.fetchone()
     if not row:
+        logger.debug(
+            "fetch_ops_kpi_metrics_for_date_range: no rows %s..%s row_kind=%s region=%r zoo=%r",
+            date_start,
+            date_end,
+            row_kind,
+            region,
+            zoo,
+        )
         return (0, None, None)
     raw = _ops_kpi_raw_tuple_from_row(row[0], row[1], row[2])
-    return _ops_kpi_table_triple(raw)
+    triple = _ops_kpi_table_triple(raw)
+    logger.debug(
+        "fetch_ops_kpi_metrics_for_date_range: %s..%s row_kind=%s -> events=%s",
+        date_start,
+        date_end,
+        row_kind,
+        triple[0],
+    )
+    return triple
 
 
 def fetch_monthly_charts_from_availability_only(

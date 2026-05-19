@@ -1,8 +1,16 @@
-import pandas as pd
-import numpy as np
-from datetime import datetime
+import argparse
+import logging
 import re
+import sys
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
 from openpyxl import load_workbook
+
+from operations_kpi_logging import add_log_level_arg, configure_logging
+
+logger = logging.getLogger("operations_kpi.etl.transform_daily_availability_robust")
 
 
 def _read_excel_raw(file_path, sheet_name=None, data_only=False):
@@ -75,7 +83,7 @@ def transform_daily_availability(
         if fixed_cols_end is None:
             raise ValueError("Could not auto-detect where date columns start. Please specify fixed_cols_end parameter.")
     
-    print(f"Fixed columns end at column index: {fixed_cols_end}")
+    logger.debug("Fixed columns end at column index: %s", fixed_cols_end)
     
     # Extract fixed columns
     if data_only:
@@ -91,8 +99,8 @@ def transform_daily_availability(
             fixed_df = pd.read_excel(file_path, usecols=range(fixed_cols_end), header=header_row)
     fixed_df = fixed_df.dropna(how='all')  # Remove completely empty rows
     
-    print(f"Fixed columns: {list(fixed_df.columns)}")
-    print(f"Number of fixed data rows: {len(fixed_df)}")
+    logger.debug("Fixed columns: %s", list(fixed_df.columns))
+    logger.debug("Number of fixed data rows: %d", len(fixed_df))
     
     # Parse date columns from row 0
     date_columns_info = []
@@ -116,7 +124,7 @@ def transform_daily_availability(
                 # Try to parse as datetime
                 try:
                     date_value = pd.to_datetime(date_cell)
-                except:
+                except (ValueError, TypeError):
                     date_value = None
             
             if date_value is not None:
@@ -125,7 +133,7 @@ def transform_daily_availability(
                     'col_start': fixed_cols_end + i,
                 })
     
-    print(f"Found {len(date_columns_info)} date columns")
+    logger.debug("Found %d date columns", len(date_columns_info))
     
     # Transform data
     result_rows = []
@@ -133,7 +141,11 @@ def transform_daily_availability(
     # Data starts at data_start_row
     num_data_rows = len(df_raw) - data_start_row
     
-    print(f"Processing {num_data_rows} data rows starting from row {data_start_row}")
+    logger.debug(
+        "Processing %d data rows starting from row %d",
+        num_data_rows,
+        data_start_row,
+    )
     
     for date_info in date_columns_info:
         date = date_info['date']
@@ -192,61 +204,67 @@ def transform_daily_availability(
     return result_df
 
 
-def main():
-    input_file = 'daily_availability_jan_26.xlsx'
-    sheet_name = 'Daily Site Availability'
-    output_file = 'daily_availability_jan_26_transformed.csv'
-    
-    print("=" * 60)
-    print("Daily Availability Data Transformer")
-    print("=" * 60)
-    print(f"\nInput file: {input_file}")
-    print(f"Sheet name: {sheet_name}")
-    
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Transform daily availability Excel to CSV.")
+    parser.add_argument("--input", default="daily_availability_jan_26.xlsx")
+    parser.add_argument("--sheet", default="Daily Site Availability")
+    parser.add_argument("--output", default="daily_availability_jan_26_transformed.csv")
+    add_log_level_arg(parser)
+    args = parser.parse_args()
+    configure_logging(args.log_level)
+
+    input_file = args.input
+    sheet_name = args.sheet
+    output_file = args.output
+
+    logger.info("Daily Availability Data Transformer")
+    logger.info("Input file: %s", input_file)
+    logger.info("Sheet name: %s", sheet_name)
+
     try:
         df_transformed = transform_daily_availability(input_file, sheet_name=sheet_name)
-        
-        print("\n" + "=" * 60)
-        print("Transformation Summary")
-        print("=" * 60)
-        print(f"Output shape: {df_transformed.shape[0]} rows × {df_transformed.shape[1]} columns")
-        print(f"\nColumns: {list(df_transformed.columns)}")
-        print(f"\nFirst few rows:")
-        print(df_transformed.head(10).to_string())
-        print(f"\nDate range: {df_transformed['Date'].min()} to {df_transformed['Date'].max()}")
-        print(f"Unique dates: {df_transformed['Date'].nunique()}")
-        
-        print(f"\nSaving to {output_file}...")
+
+        logger.info(
+            "Output shape: %d rows x %d columns",
+            df_transformed.shape[0],
+            df_transformed.shape[1],
+        )
+        logger.debug("Columns: %s", list(df_transformed.columns))
+        logger.debug("First rows:\n%s", df_transformed.head(10).to_string())
+        logger.info(
+            "Date range: %s .. %s (%d unique dates)",
+            df_transformed["Date"].min(),
+            df_transformed["Date"].max(),
+            df_transformed["Date"].nunique(),
+        )
+
+        logger.info("Saving to %s", output_file)
         df_transformed.to_csv(output_file, index=False)
-        
-        # Also save as Excel with proper date formatting
-        output_excel = output_file.replace('.csv', '.xlsx')
-        df_transformed['Date'] = pd.to_datetime(df_transformed['Date'])
+
+        output_excel = output_file.replace(".csv", ".xlsx")
+        df_transformed["Date"] = pd.to_datetime(df_transformed["Date"])
         df_transformed.to_excel(output_excel, index=False)
-        
-        print(f"\nSuccess! Output saved to:")
-        print(f"  - {output_file}")
-        print(f"  - {output_excel}")
-        
+
+        logger.info("Success! Output saved to %s and %s", output_file, output_excel)
+
     except FileNotFoundError:
-        print(f"\nError: File '{input_file}' not found.")
-        print("Please ensure the file exists in the current directory.")
+        logger.error("File not found: %s", input_file)
+        raise SystemExit(1) from None
     except ValueError as e:
-        if 'Worksheet named' in str(e) or 'sheet' in str(e).lower():
-            print(f"\nError: Sheet '{sheet_name}' not found in the file.")
-            print("Available sheets:")
+        if "Worksheet named" in str(e) or "sheet" in str(e).lower():
+            logger.error("Sheet %r not found in %s", sheet_name, input_file)
             try:
                 xl_file = pd.ExcelFile(input_file)
-                print(f"  {', '.join(xl_file.sheet_names)}")
-            except:
-                pass
-        else:
-            raise
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
+                logger.error("Available sheets: %s", ", ".join(xl_file.sheet_names))
+            except Exception:
+                logger.exception("Could not list workbook sheets")
+            raise SystemExit(1) from e
+        logger.exception("Transformation failed")
+        raise SystemExit(1) from e
+    except Exception:
+        logger.exception("Transformation failed")
+        raise SystemExit(1) from None
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

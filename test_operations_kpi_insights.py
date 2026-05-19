@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import unittest
 
 import pandas as pd
@@ -121,6 +122,19 @@ class BuildCellInsightCsvTests(unittest.TestCase):
                 "TARGET",
             )
         self.assertIn("TARGET", str(ctx.exception))
+
+    def test_invalid_period_logs_warning(self) -> None:
+        with self.assertLogs("operations_kpi.insights", level="WARNING") as captured:
+            with self.assertRaises(ValueError):
+                insights._validate_metric_period(
+                    "events",
+                    "NotAPeriod",
+                    self.periods,
+                    {},
+                )
+        self.assertTrue(
+            any("Invalid period" in line for line in captured.output)
+        )
 
 
 if __name__ == "__main__":

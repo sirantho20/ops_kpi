@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
+from operations_kpi_logging import add_log_level_arg, configure_logging, log_timing
 from merge_daily_availability_overall import (
     LEGACY_COLUMNS,
     DAILY_SITE_AVAILABILITY_SHEET,
@@ -20,6 +22,8 @@ from merge_daily_availability_overall import (
     normalize_for_merge,
 )
 from transform_daily_availability_robust import transform_daily_availability
+
+logger = logging.getLogger("operations_kpi.etl.rebuild_monthly_availability")
 
 
 def month_from_filename(path: Path) -> tuple[datetime, str]:
@@ -58,7 +62,12 @@ def monthly_workbooks(folder: Path) -> list[tuple[Path, datetime, str]]:
 def transpose_monthly_workbooks(entries: list[tuple[Path, datetime, str]]) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for path, tab_dt, label in entries:
-        print(f"\n--- Monthly workbook {label!r} ({path.name}) -> {tab_dt:%Y-%m} ---")
+        logger.info(
+            "Monthly workbook %r (%s) -> %s",
+            label,
+            path.name,
+            tab_dt.strftime("%Y-%m"),
+        )
         raw = transform_daily_availability(
             str(path),
             sheet_name=DAILY_SITE_AVAILABILITY_SHEET,
@@ -114,11 +123,13 @@ def parse_args() -> argparse.Namespace:
         default="site_site.csv",
         help="Path to Zoo mapping CSV used to enrich the consolidated master data.",
     )
+    add_log_level_arg(parser)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    configure_logging(args.log_level)
     root = Path(__file__).resolve().parent
     source_folder = root / args.source_folder if not Path(args.source_folder).is_absolute() else Path(args.source_folder)
     output_csv = root / args.output_csv if not Path(args.output_csv).is_absolute() else Path(args.output_csv)
@@ -134,35 +145,46 @@ def main() -> None:
         else Path(args.zoo_mapping)
     )
 
-    entries = monthly_workbooks(source_folder)
-    print("Monthly files to process:")
-    for path, dt, _ in entries:
-        print(f"  - {path.name} -> {dt:%Y-%m}")
+    try:
+        entries = monthly_workbooks(source_folder)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(1) from exc
 
-    combined = transpose_monthly_workbooks(entries)
+    logger.info("Monthly files to process:")
+    for path, dt, _ in entries:
+        logger.info("  - %s -> %s", path.name, dt.strftime("%Y-%m"))
+
+    with log_timing(logger, "transpose_monthly_workbooks", files=len(entries)):
+        combined = transpose_monthly_workbooks(entries)
     deduped, dropped = dedupe_monthly_data(combined)
     enriched = merge_dispatch_metrics(deduped, dispatch_path)
     enriched = merge_zoo_mapping(enriched, zoo_mapping_path)
 
-    print(f"\nCombined rows before dedupe: {len(combined)}")
-    print(f"Duplicate site/date rows removed: {dropped}")
-    print(
-        f"Rebuilt shape: {len(enriched)} rows, "
-        f"Date {enriched['Date'].min().date()} .. {enriched['Date'].max().date()}"
+    logger.info("Combined rows before dedupe: %d", len(combined))
+    logger.info("Duplicate site/date rows removed: %d", dropped)
+    logger.info(
+        "Rebuilt shape: %d rows, Date %s .. %s",
+        len(enriched),
+        enriched["Date"].min().date(),
+        enriched["Date"].max().date(),
     )
-    print(
-        "Dispatch totals merged into output: "
-        f"SIC Count={int(enriched['SIC Count'].sum()):,}, "
-        f"CM Count={int(enriched['CM Count'].sum()):,}"
+    logger.info(
+        "Dispatch totals merged into output: SIC Count=%s, CM Count=%s",
+        f"{int(enriched['SIC Count'].sum()):,}",
+        f"{int(enriched['CM Count'].sum()):,}",
     )
     mapped_zoo_sites = int(enriched.loc[enriched["Zoo"].notna(), "PTCI Number"].nunique())
-    print(f"Zoo coverage merged into output: {mapped_zoo_sites:,} mapped PTCI sites")
+    logger.info(
+        "Zoo coverage merged into output: %s mapped PTCI sites",
+        f"{mapped_zoo_sites:,}",
+    )
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     enriched.to_csv(output_csv, index=False)
     enriched.to_excel(output_xlsx, index=False)
-    print(f"Wrote {output_csv}")
-    print(f"Wrote {output_xlsx}")
+    logger.info("Wrote %s", output_csv)
+    logger.info("Wrote %s", output_xlsx)
 
 
 if __name__ == "__main__":
