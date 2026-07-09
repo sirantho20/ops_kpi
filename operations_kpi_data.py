@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence, Union
 
 import pandas as pd
 import psycopg
@@ -131,9 +131,25 @@ SITE_VISIT_TABLE_CANDIDATES: tuple[str, ...] = (
 # Table columns shown for metrics ``visit`` (SIC) and ``siteVisit`` only.
 VISIT_TABLE_FY_YEARS: tuple[int, int] = (2025, 2026)
 VISIT_TABLE_TOTAL_PERIOD_KEY = "TOTAL"
-SITE_VISIT_TABLE_MONTH_PERIODS: tuple[pd.Period, ...] = tuple(
-    pd.Period(f"{VISIT_TABLE_FY_YEARS[1]}-{month:02d}", freq="M") for month in range(1, 4)
-)
+
+
+def site_visit_table_month_periods(df: pd.DataFrame) -> tuple[pd.Period, ...]:
+    """Jan through the latest FY-current-year month present in ``df``.
+
+    Grows automatically as new months of data land in the database, instead
+    of a fixed cutoff.
+    """
+    year = VISIT_TABLE_FY_YEARS[1]
+    if df.empty or "month_period" not in df.columns:
+        return ()
+    year_months = df.loc[df["Date"].dt.year == year, "month_period"].dropna()
+    if year_months.empty:
+        return ()
+    latest_month = year_months.max()
+    return tuple(
+        pd.Period(f"{year}-{month:02d}", freq="M")
+        for month in range(1, int(latest_month.month) + 1)
+    )
 
 
 @dataclass(frozen=True)
@@ -689,6 +705,7 @@ def load_dashboard_payload(
                 region="Overall",
                 zoo=None,
             ),
+            site_visit_month_periods=site_visit_table_month_periods(df),
         )
 
         territory_order, territory_charts = build_territory_charts(
@@ -1035,8 +1052,8 @@ def build_periods(df: pd.DataFrame) -> dict[str, pd.Series]:
     current_year_months = sorted(
         df.loc[df["Date"].dt.year == current_year, "month_period"].dropna().unique().tolist()
     )
-    for month_period in current_year_months:
-        periods[period_key(month_period)] = df["month_period"] == month_period
+    for column_key, months in group_month_periods_for_table(current_year_months):
+        periods[column_key] = df["month_period"].isin(months)
 
     return periods
 
@@ -1047,6 +1064,50 @@ def fy_key(year: int) -> str:
 
 def period_key(month_period: pd.Period) -> str:
     return month_period.strftime("%b_%y").upper()
+
+
+def quarter_key(month_period: pd.Period) -> str:
+    return f"Q{month_period.quarter}_{month_period.year}"
+
+
+# Once a metric's monthly column count exceeds this, the oldest complete
+# calendar quarters collapse into single Q_YYYY columns (most recent months
+# stay individual) so the table doesn't keep growing a column every month.
+TABLE_MONTH_COLUMN_COLLAPSE_THRESHOLD = 5
+
+
+def group_month_periods_for_table(
+    month_periods: Sequence[pd.Period],
+    *,
+    threshold: int = TABLE_MONTH_COLUMN_COLLAPSE_THRESHOLD,
+) -> list[tuple[str, tuple[pd.Period, ...]]]:
+    """Group consecutive months into columns, collapsing the oldest complete
+    calendar quarters (Jan-Mar, Apr-Jun, ...) into one column each until the
+    column count is at or below ``threshold``. Assumes ``month_periods`` is
+    sorted and contiguous from the start of the year.
+    """
+    groups: list[tuple[str, tuple[pd.Period, ...]]] = [
+        (period_key(m), (m,)) for m in month_periods
+    ]
+    while len(groups) > threshold:
+        collapsed = False
+        for i in range(len(groups) - 2):
+            m0, m1, m2 = groups[i], groups[i + 1], groups[i + 2]
+            if (
+                len(m0[1]) == 1
+                and len(m1[1]) == 1
+                and len(m2[1]) == 1
+                and m0[1][0].month % 3 == 1
+                and m1[1][0] == m0[1][0] + 1
+                and m2[1][0] == m1[1][0] + 1
+            ):
+                p0 = m0[1][0]
+                groups[i : i + 3] = [(quarter_key(p0), (p0, m1[1][0], m2[1][0]))]
+                collapsed = True
+                break
+        if not collapsed:
+            break
+    return groups
 
 
 def build_visit_compact_periods(df: pd.DataFrame) -> dict[str, pd.Series]:
@@ -1061,23 +1122,32 @@ def build_visit_compact_periods(df: pd.DataFrame) -> dict[str, pd.Series]:
     }
 
 
-def build_site_visit_table_periods(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """FY years and Q1 monthly columns for the Site Visit table (no TOTAL)."""
+def build_site_visit_table_periods(
+    df: pd.DataFrame, month_periods: Sequence[pd.Period] | None = None
+) -> dict[str, pd.Series]:
+    """FY years and monthly/quarterly columns (Jan through latest available month) for the Site Visit table (no TOTAL)."""
     y0, y1 = VISIT_TABLE_FY_YEARS
+    if month_periods is None:
+        month_periods = site_visit_table_month_periods(df)
     periods = {
         fy_key(y0): df["Date"].dt.year == y0,
         fy_key(y1): df["Date"].dt.year == y1,
     }
-    for month_period in SITE_VISIT_TABLE_MONTH_PERIODS:
-        periods[period_key(month_period)] = df["month_period"] == month_period
+    for column_key, months in group_month_periods_for_table(month_periods):
+        periods[column_key] = df["month_period"].isin(months)
     return periods
 
 
-def site_visit_table_period_order() -> list[str]:
+def site_visit_table_period_order(
+    month_periods: Sequence[pd.Period] = (),
+) -> list[str]:
     return [
         fy_key(VISIT_TABLE_FY_YEARS[0]),
         fy_key(VISIT_TABLE_FY_YEARS[1]),
-        *[period_key(month_period) for month_period in SITE_VISIT_TABLE_MONTH_PERIODS],
+        *[
+            column_key
+            for column_key, _ in group_month_periods_for_table(month_periods)
+        ],
         "TARGET",
     ]
 
@@ -1091,6 +1161,7 @@ def build_meta(
         fy_key(VISIT_TABLE_FY_YEARS[1]),
         VISIT_TABLE_TOTAL_PERIOD_KEY,
     ]
+    site_visit_month_periods = site_visit_table_month_periods(df)
     return {
         "title": "Operations KPI Dashboard",
         "coverageText": (
@@ -1103,7 +1174,7 @@ def build_meta(
             "availability": full_order,
             "cm": full_order,
             "visit": compact_visit_periods,
-            "siteVisit": site_visit_table_period_order(),
+            "siteVisit": site_visit_table_period_order(site_visit_month_periods),
         },
         "periodText": "",
         "limitations": [],
@@ -1130,10 +1201,10 @@ def build_table_rows(
     targets: OpsKpiTargets,
     *,
     ops_kpi_cubes: OpsKpiFactCubes | None = None,
-    period_ops_index: dict[str, tuple[Literal["fy", "month"], int | date | None]]
-    | None = None,
+    period_ops_index: dict[str, tuple[OpsIndexKind, OpsIndexValue]] | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
+    site_visit_month_periods = site_visit_table_month_periods(df)
     for region_index, region in enumerate(regions_for_table(df)):
         region_df = scope_frame(df, region)
         zoo_names = ordered_zoo_names(region_df)
@@ -1159,6 +1230,7 @@ def build_table_rows(
                 group_start=True,
                 group_end=not zoo_names,
                 ops_kpi_table_actuals=region_ops,
+                site_visit_month_periods=site_visit_month_periods,
             )
         )
         for zoo_index, zoo_name in enumerate(zoo_names, start=1):
@@ -1185,6 +1257,7 @@ def build_table_rows(
                     group_start=False,
                     group_end=zoo_index == len(zoo_names),
                     ops_kpi_table_actuals=zoo_ops,
+                    site_visit_month_periods=site_visit_month_periods,
                 )
             )
     return rows
@@ -1213,6 +1286,7 @@ def build_table_row(
     *,
     ops_kpi_table_actuals: dict[str, tuple[int, float | None, float | None]]
     | None = None,
+    site_visit_month_periods: Sequence[pd.Period] | None = None,
 ) -> dict:
     previous_fy_label = fiscal_year_labels(periods)[0]
     baseline_events = aggregate_event_count_table(scoped_df.loc[periods[previous_fy_label]])
@@ -1241,7 +1315,9 @@ def build_table_row(
         site_visit_target = round(site_visit_target)
 
     visit_periods = build_visit_compact_periods(scoped_df)
-    site_visit_periods = build_site_visit_table_periods(scoped_df)
+    site_visit_periods = build_site_visit_table_periods(
+        scoped_df, site_visit_month_periods
+    )
     if ops_kpi_table_actuals is not None:
         ev_act = {p: ops_kpi_table_actuals[p][0] for p in periods}
         mttr_act = {p: ops_kpi_table_actuals[p][1] for p in periods}
@@ -1676,6 +1752,9 @@ class OpsKpiFactCubes:
     month_overall: dict[date, tuple[float, float | None, float | None]]
     month_region: dict[tuple[date, str], tuple[float, float | None, float | None]]
     month_zoo: dict[tuple[date, str, str], tuple[float, float | None, float | None]]
+    quarter_overall: dict[tuple[int, int], tuple[float, float | None, float | None]]
+    quarter_region: dict[tuple[int, int, str], tuple[float, float | None, float | None]]
+    quarter_zoo: dict[tuple[int, int, str, str], tuple[float, float | None, float | None]]
 
 
 def _ops_kpi_raw_tuple_from_row(
@@ -1810,6 +1889,58 @@ def fetch_ops_kpi_availability_cubes(cur) -> OpsKpiFactCubes:
         rk, zk = str(row[1]), str(row[2])
         month_zoo[(ms, rk, zk)] = _ops_kpi_raw_tuple_from_row(row[3], row[4], row[5])
 
+    cur.execute(
+        f"""
+        SELECT EXTRACT(YEAR FROM date)::int AS yr,
+               EXTRACT(QUARTER FROM date)::int AS q,
+               {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+        """
+    )
+    quarter_overall: dict[tuple[int, int], tuple[float, float | None, float | None]] = {}
+    for row in cur.fetchall():
+        yr, q = int(row[0]), int(row[1])
+        quarter_overall[(yr, q)] = _ops_kpi_raw_tuple_from_row(row[2], row[3], row[4])
+
+    cur.execute(
+        f"""
+        SELECT EXTRACT(YEAR FROM date)::int AS yr,
+               EXTRACT(QUARTER FROM date)::int AS q,
+               {_OPS_KPI_REGION_DISPLAY_SQL} AS rk,
+               {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2, 3
+        """
+    )
+    quarter_region: dict[
+        tuple[int, int, str], tuple[float, float | None, float | None]
+    ] = {}
+    for row in cur.fetchall():
+        yr, q, rk = int(row[0]), int(row[1]), str(row[2])
+        quarter_region[(yr, q, rk)] = _ops_kpi_raw_tuple_from_row(row[3], row[4], row[5])
+
+    cur.execute(
+        f"""
+        SELECT EXTRACT(YEAR FROM date)::int AS yr,
+               EXTRACT(QUARTER FROM date)::int AS q,
+               {_OPS_KPI_REGION_DISPLAY_SQL} AS rk,
+               {_OPS_KPI_ZOO_KEY_SQL} AS zk,
+               {agg}
+        FROM ops_kpi_availability
+        GROUP BY 1, 2, 3, 4
+        """
+    )
+    quarter_zoo: dict[
+        tuple[int, int, str, str], tuple[float, float | None, float | None]
+    ] = {}
+    for row in cur.fetchall():
+        yr, q, rk, zk = int(row[0]), int(row[1]), str(row[2]), str(row[3])
+        quarter_zoo[(yr, q, rk, zk)] = _ops_kpi_raw_tuple_from_row(
+            row[4], row[5], row[6]
+        )
+
     return OpsKpiFactCubes(
         year_overall=year_overall,
         year_region=year_region,
@@ -1817,17 +1948,30 @@ def fetch_ops_kpi_availability_cubes(cur) -> OpsKpiFactCubes:
         month_overall=month_overall,
         month_region=month_region,
         month_zoo=month_zoo,
+        quarter_overall=quarter_overall,
+        quarter_region=quarter_region,
+        quarter_zoo=quarter_zoo,
     )
+
+
+_QUARTER_KEY_RE = re.compile(r"^Q([1-4])_(\d{4})$")
+
+OpsIndexKind = Literal["fy", "month", "quarter"]
+OpsIndexValue = Union[int, date, tuple[int, int], None]
 
 
 def build_period_ops_index(
     df: pd.DataFrame, periods: dict[str, pd.Series]
-) -> dict[str, tuple[Literal["fy", "month"], int | date | None]]:
-    """Map each table period key to a fiscal year or calendar month start (for cube lookup)."""
-    out: dict[str, tuple[Literal["fy", "month"], int | date | None]] = {}
+) -> dict[str, tuple[OpsIndexKind, OpsIndexValue]]:
+    """Map each table period key to a fiscal year, quarter, or calendar month (for cube lookup)."""
+    out: dict[str, tuple[OpsIndexKind, OpsIndexValue]] = {}
     for name, mask in periods.items():
+        quarter_match = _QUARTER_KEY_RE.match(name)
         if name.startswith("FY"):
             out[name] = ("fy", int(name[2:]))
+        elif quarter_match:
+            quarter, year = int(quarter_match.group(1)), int(quarter_match.group(2))
+            out[name] = ("quarter", (year, quarter))
         else:
             sub = df.loc[mask, "Date"]
             if sub.empty:
@@ -1842,7 +1986,7 @@ def build_period_ops_index(
 
 def table_ops_actuals_for_row(
     cubes: OpsKpiFactCubes,
-    period_ops_index: dict[str, tuple[Literal["fy", "month"], int | date | None]],
+    period_ops_index: dict[str, tuple[OpsIndexKind, OpsIndexValue]],
     *,
     row_kind: str,
     region: str | None,
@@ -1851,19 +1995,28 @@ def table_ops_actuals_for_row(
     """Outages / MTTR / availability actuals per period from pre-fetched cubes."""
     actuals: dict[str, tuple[int, float | None, float | None]] = {}
     for pk, kind_y in period_ops_index.items():
-        kind, y_or_ms = kind_y
+        kind, value = kind_y
         raw: tuple[float, float | None, float | None] | None = None
         if kind == "fy":
-            assert isinstance(y_or_ms, int)
-            yr = y_or_ms
+            assert isinstance(value, int)
+            yr = value
             if row_kind == "footer":
                 raw = cubes.year_overall.get(yr)
             elif row_kind == "region" and region is not None:
                 raw = cubes.year_region.get((yr, region))
             elif row_kind == "zoo" and region is not None and zoo is not None:
                 raw = cubes.year_zoo.get((yr, region, zoo))
+        elif kind == "quarter":
+            assert isinstance(value, tuple)
+            yr, q = value
+            if row_kind == "footer":
+                raw = cubes.quarter_overall.get((yr, q))
+            elif row_kind == "region" and region is not None:
+                raw = cubes.quarter_region.get((yr, q, region))
+            elif row_kind == "zoo" and region is not None and zoo is not None:
+                raw = cubes.quarter_zoo.get((yr, q, region, zoo))
         else:
-            ms = y_or_ms
+            ms = value
             if ms is None:
                 raw = None
             elif row_kind == "footer":

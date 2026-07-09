@@ -63,6 +63,9 @@ class YearRegionPartitionSumTests(unittest.TestCase):
             month_overall={},
             month_region={},
             month_zoo={},
+            quarter_overall={},
+            quarter_region={},
+            quarter_zoo={},
         )
         s = sum(cubes.year_region[(yr, r)][0] for r in [*REGION_ORDER, REGION_OTHER])
         self.assertAlmostEqual(s, cubes.year_overall[yr][0])

@@ -162,7 +162,7 @@ class FetchTableCubesSqlTests(unittest.TestCase):
         cur = FakeCur()
         fetch_ops_kpi_availability_cubes(cur)
 
-        self.assertEqual(len(executed), 6)
+        self.assertEqual(len(executed), 9)
         for sql in executed:
             low = sql.lower()
             self.assertIn("ops_kpi_availability", low)
@@ -171,6 +171,50 @@ class FetchTableCubesSqlTests(unittest.TestCase):
             self.assertIn("total_available_minutes", low)
             self.assertIn("uptime_per_tenant", low)
             self.assertNotIn(" join ", f" {low} ")
+
+        quarter_queries = [sql for sql in executed if "quarter" in sql.lower()]
+        self.assertEqual(len(quarter_queries), 3)
+
+
+class BuildPeriodOpsIndexQuarterTests(unittest.TestCase):
+    def test_quarter_column_maps_to_quarter_kind(self) -> None:
+        from operations_kpi_data import build_period_ops_index
+
+        df = pd.DataFrame({"Date": pd.to_datetime(["2026-01-15", "2026-02-15"])})
+        periods = {
+            "FY2026": df["Date"].dt.year == 2026,
+            "Q1_2026": df["Date"].dt.year == 2026,
+        }
+        index = build_period_ops_index(df, periods)
+        self.assertEqual(index["FY2026"], ("fy", 2026))
+        self.assertEqual(index["Q1_2026"], ("quarter", (2026, 1)))
+
+    def test_table_ops_actuals_for_row_reads_quarter_cube(self) -> None:
+        from operations_kpi_data import OpsKpiFactCubes, table_ops_actuals_for_row
+
+        cubes = OpsKpiFactCubes(
+            year_overall={},
+            year_region={},
+            year_zoo={},
+            month_overall={},
+            month_region={},
+            month_zoo={},
+            quarter_overall={(2026, 1): (30.0, 45.5, 99.5)},
+            quarter_region={(2026, 1, "NCR"): (10.0, 40.0, 99.9)},
+            quarter_zoo={},
+        )
+        period_ops_index = {
+            "Q1_2026": ("quarter", (2026, 1)),
+        }
+        footer_actuals = table_ops_actuals_for_row(
+            cubes, period_ops_index, row_kind="footer", region=None, zoo=None
+        )
+        self.assertEqual(footer_actuals["Q1_2026"], (30, 45.5, 99.5))
+
+        region_actuals = table_ops_actuals_for_row(
+            cubes, period_ops_index, row_kind="region", region="NCR", zoo=None
+        )
+        self.assertEqual(region_actuals["Q1_2026"], (10, 40.0, 99.9))
 
 
 if __name__ == "__main__":

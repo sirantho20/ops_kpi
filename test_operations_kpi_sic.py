@@ -7,7 +7,6 @@ import pandas as pd
 from operations_kpi_data import (
     OpsKpiSicColumns,
     OpsKpiSiteVisitColumns,
-    SITE_VISIT_TABLE_MONTH_PERIODS,
     VISIT_TABLE_FY_YEARS,
     VISIT_TABLE_TOTAL_PERIOD_KEY,
     _ops_kpi_load_sql,
@@ -18,7 +17,9 @@ from operations_kpi_data import (
     default_ops_kpi_targets,
     detect_ops_kpi_sic_columns,
     fy_key,
+    group_month_periods_for_table,
     period_key,
+    site_visit_table_month_periods,
     site_visit_table_period_order,
 )
 
@@ -181,12 +182,14 @@ class SicTableTargetTests(unittest.TestCase):
         self.assertNotIn("TARGET", row["visit"])
         self.assertNotIn(VISIT_TABLE_TOTAL_PERIOD_KEY, row["siteVisit"])
         self.assertIn("TARGET", row["siteVisit"])
-        for month_period in SITE_VISIT_TABLE_MONTH_PERIODS:
-            self.assertIn(period_key(month_period), row["siteVisit"])
+        for column_key, _ in group_month_periods_for_table(
+            site_visit_table_month_periods(df)
+        ):
+            self.assertIn(column_key, row["siteVisit"])
 
 
 class SiteVisitTablePeriodTests(unittest.TestCase):
-    def test_site_visit_periods_have_fy_and_q1_months_no_total(self) -> None:
+    def test_site_visit_periods_have_fy_and_available_months_no_total(self) -> None:
         df = pd.DataFrame(
             {
                 "Date": pd.to_datetime(
@@ -199,11 +202,88 @@ class SiteVisitTablePeriodTests(unittest.TestCase):
         self.assertNotIn(VISIT_TABLE_TOTAL_PERIOD_KEY, periods)
         self.assertIn(fy_key(2025), periods)
         self.assertIn(fy_key(2026), periods)
-        for month_period in SITE_VISIT_TABLE_MONTH_PERIODS:
+        for month_period in site_visit_table_month_periods(df):
             key = period_key(month_period)
             self.assertIn(key, periods)
             expected = df["month_period"] == month_period
             self.assertTrue(periods[key].equals(expected))
+
+    def test_site_visit_month_periods_extend_past_old_q1_cutoff(self) -> None:
+        """Regression test: columns must track the latest month in the data,
+        not stop at March, as the database gains new months (e.g. June)."""
+        df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-01-15", "2026-04-01", "2026-05-01", "2026-06-01"]
+                ),
+            }
+        )
+        df["month_period"] = df["Date"].dt.to_period("M")
+        month_periods = site_visit_table_month_periods(df)
+        self.assertEqual(
+            [period_key(p) for p in month_periods],
+            ["JAN_26", "FEB_26", "MAR_26", "APR_26", "MAY_26", "JUN_26"],
+        )
+        periods = build_site_visit_table_periods(df)
+        self.assertIn("JUN_26", periods)
+        self.assertTrue(periods["JUN_26"].equals(df["month_period"] == pd.Period("2026-06", freq="M")))
+
+
+class GroupMonthPeriodsForTableTests(unittest.TestCase):
+    def test_collapses_oldest_complete_quarter_once_over_threshold(self) -> None:
+        """Jan-Jun (6 months, > 5) collapses Jan/Feb/Mar into Q1_2026 while
+        Apr/May/Jun stay as individual columns, per the requested behavior."""
+        months = pd.period_range("2026-01", "2026-06", freq="M")
+        groups = group_month_periods_for_table(months)
+        self.assertEqual(
+            [key for key, _ in groups],
+            ["Q1_2026", "APR_26", "MAY_26", "JUN_26"],
+        )
+        self.assertEqual(groups[0][1], tuple(months[0:3]))
+
+    def test_no_collapse_at_or_under_threshold(self) -> None:
+        months = pd.period_range("2026-01", "2026-05", freq="M")
+        groups = group_month_periods_for_table(months)
+        self.assertEqual(
+            [key for key, _ in groups],
+            ["JAN_26", "FEB_26", "MAR_26", "APR_26", "MAY_26"],
+        )
+
+    def test_collapses_second_quarter_when_still_over_threshold(self) -> None:
+        months = pd.period_range("2026-01", "2026-09", freq="M")
+        groups = group_month_periods_for_table(months)
+        self.assertEqual(
+            [key for key, _ in groups],
+            ["Q1_2026", "Q2_2026", "JUL_26", "AUG_26", "SEP_26"],
+        )
+
+
+class BuildPeriodsQuarterCollapseTests(unittest.TestCase):
+    def test_build_periods_collapses_current_year_months(self) -> None:
+        from operations_kpi_data import build_periods
+
+        df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    [
+                        "2025-03-01",
+                        "2026-01-01",
+                        "2026-02-01",
+                        "2026-03-01",
+                        "2026-04-01",
+                        "2026-05-01",
+                        "2026-06-01",
+                    ]
+                )
+            }
+        )
+        df["month_period"] = df["Date"].dt.to_period("M")
+        periods = build_periods(df)
+        self.assertEqual(
+            list(periods.keys()),
+            ["FY2025", "FY2026", "Q1_2026", "APR_26", "MAY_26", "JUN_26"],
+        )
+        self.assertEqual(int(periods["Q1_2026"].sum()), 3)
 
 
 class VisitCompactPeriodTests(unittest.TestCase):
