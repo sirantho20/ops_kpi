@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import logging
@@ -25,6 +26,8 @@ def run_test_server(
     debug_errors: bool = False,
     require_warm_for_readyz: bool = False,
     serve_loading_until_warm: bool = False,
+    basic_auth_username: str | None = None,
+    basic_auth_password: str | None = None,
 ):
     dashboard.reset_dashboard_warm_state()
     with TemporaryDirectory() as temp_dir:
@@ -41,6 +44,8 @@ def run_test_server(
             logger=logging.getLogger("test.operations_kpi_dashboard"),
             require_warm_for_readyz=require_warm_for_readyz,
             serve_loading_until_warm=serve_loading_until_warm,
+            basic_auth_username=basic_auth_username,
+            basic_auth_password=basic_auth_password,
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -72,6 +77,87 @@ def fetch_error_text(url: str) -> tuple[int, str, str]:
             exc.headers.get("Content-Type", ""),
             exc.read().decode("utf-8"),
         )
+
+
+def basic_auth_header(username: str, password: str) -> dict[str, str]:
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
+class BasicAuthTests(unittest.TestCase):
+    def test_disabled_by_default_allows_root_without_credentials(self) -> None:
+        payload = {"meta": {}, "table": {"rows": [], "footer": {}}, "charts": {}}
+        with mock.patch.object(dashboard, "load_dashboard_payload", return_value=payload):
+            with mock.patch.object(
+                dashboard, "ops_kpi_data_fingerprint", return_value="fp1"
+            ):
+                with run_test_server() as base_url:
+                    with urllib.request.urlopen(f"{base_url}/", timeout=3) as response:
+                        status = response.status
+
+        self.assertEqual(status, 200)
+
+    def test_root_rejects_missing_credentials_when_enabled(self) -> None:
+        with run_test_server(
+            basic_auth_username="ops-admin", basic_auth_password="s3cret"
+        ) as base_url:
+            status, content_type, _ = fetch_error_text(f"{base_url}/")
+
+        self.assertEqual(status, 401)
+
+    def test_root_rejects_wrong_credentials_when_enabled(self) -> None:
+        with run_test_server(
+            basic_auth_username="ops-admin", basic_auth_password="s3cret"
+        ) as base_url:
+            req = urllib.request.Request(
+                f"{base_url}/", headers=basic_auth_header("ops-admin", "wrong")
+            )
+            try:
+                urllib.request.urlopen(req, timeout=3)
+                self.fail("expected HTTPError")
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                www_authenticate = exc.headers.get("WWW-Authenticate", "")
+
+        self.assertEqual(status, 401)
+        self.assertIn("Basic", www_authenticate)
+
+    def test_root_accepts_correct_credentials_when_enabled(self) -> None:
+        payload = {"meta": {}, "table": {"rows": [], "footer": {}}, "charts": {}}
+        with mock.patch.object(dashboard, "load_dashboard_payload", return_value=payload):
+            with mock.patch.object(
+                dashboard, "ops_kpi_data_fingerprint", return_value="fp1"
+            ):
+                with run_test_server(
+                    basic_auth_username="ops-admin", basic_auth_password="s3cret"
+                ) as base_url:
+                    req = urllib.request.Request(
+                        f"{base_url}/",
+                        headers=basic_auth_header("ops-admin", "s3cret"),
+                    )
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        status = response.status
+
+        self.assertEqual(status, 200)
+
+    def test_dashboard_payload_api_requires_auth_when_enabled(self) -> None:
+        with run_test_server(
+            basic_auth_username="ops-admin", basic_auth_password="s3cret"
+        ) as base_url:
+            status, _, _ = fetch_error_text(f"{base_url}/api/dashboard-payload")
+
+        self.assertEqual(status, 401)
+
+    def test_healthz_and_readyz_bypass_auth_when_enabled(self) -> None:
+        with run_test_server(
+            basic_auth_username="ops-admin", basic_auth_password="s3cret"
+        ) as base_url:
+            healthz_status, _ = fetch_json(f"{base_url}/healthz")
+            readyz_status, readyz_body = fetch_json(f"{base_url}/readyz")
+
+        self.assertEqual(healthz_status, 200)
+        # No DB mocked, so readiness legitimately fails, but it must not be a 401.
+        self.assertNotEqual(readyz_status, 401)
 
 
 class DashboardServerRoutesTests(unittest.TestCase):

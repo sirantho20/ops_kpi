@@ -18,6 +18,10 @@ EXPOSE 8054
 
 # Liveness: /healthz (no DB). Readiness / traffic gate: /readyz (DB + warm cache when pre-warm on).
 # Reverse-proxy: use deploy/nginx-proxy-timeouts.conf — default 60s proxy_read_timeout causes 504 on /.
+# Auth: set OPERATIONS_KPI_BASIC_AUTH_USERNAME and OPERATIONS_KPI_BASIC_AUTH_PASSWORD (e.g. in
+# .env passed via --env-file) to require HTTP Basic Auth on the dashboard and its /api/* routes.
+# /healthz and /readyz stay open so health checks and load balancers don't need credentials.
+# Without both vars set, the dashboard is served with no login (a warning is logged at startup).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import os, sys, urllib.request; port = os.environ.get('OPERATIONS_KPI_PORT') or os.environ.get('PORT', '8054'); urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3); sys.exit(0)"
 

@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextvars
 import html
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 import urllib.request
@@ -43,6 +46,7 @@ DEFAULT_TEMPLATE = ROOT / "Operations KPI.html"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8054
 DATA_PLACEHOLDER = "__DASHBOARD_DATA__"
+BASIC_AUTH_REALM = "Operations KPI Dashboard"
 
 _analysis_cache: dict[str, tuple[str, object, dict, OpsKpiTargets]] = {}
 
@@ -243,6 +247,16 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _basic_auth_username() -> str | None:
+    value = os.environ.get("OPERATIONS_KPI_BASIC_AUTH_USERNAME", "")
+    return value or None
+
+
+def _basic_auth_password() -> str | None:
+    value = os.environ.get("OPERATIONS_KPI_BASIC_AUTH_PASSWORD", "")
+    return value or None
+
+
 def _default_listen_port() -> int:
     """CapRover and similar platforms set PORT; prefer it over OPERATIONS_KPI_PORT."""
     if os.environ.get("PORT") is not None:
@@ -337,11 +351,25 @@ def make_handler(
     logger: logging.Logger,
     require_warm_for_readyz: bool | None = None,
     serve_loading_until_warm: bool | None = None,
+    basic_auth_username: str | None = None,
+    basic_auth_password: str | None = None,
 ):
     if require_warm_for_readyz is None:
         require_warm_for_readyz = _readyz_require_warm()
     if serve_loading_until_warm is None:
         serve_loading_until_warm = _serve_loading_until_warm()
+    if basic_auth_username is None:
+        basic_auth_username = _basic_auth_username()
+    if basic_auth_password is None:
+        basic_auth_password = _basic_auth_password()
+    auth_enabled = bool(basic_auth_username and basic_auth_password)
+    if not auth_enabled:
+        logger.warning(
+            "HTTP Basic Auth is disabled; the dashboard and its APIs are open to "
+            "anyone who can reach this host. Set OPERATIONS_KPI_BASIC_AUTH_USERNAME "
+            "and OPERATIONS_KPI_BASIC_AUTH_PASSWORD to require a login."
+        )
+
     @lru_cache(maxsize=32)
     def _rendered_html_cached(
         data_fp: str, template_path_str: str, template_mtime: float
@@ -431,6 +459,47 @@ def make_handler(
             self.end_headers()
             if send_body:
                 self.wfile.write(body)
+
+        def _has_valid_basic_auth(self) -> bool:
+            header = self.headers.get("Authorization", "")
+            if not header.startswith("Basic "):
+                return False
+            try:
+                decoded = base64.b64decode(
+                    header[len("Basic "):], validate=True
+                ).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                return False
+            user, sep, password = decoded.partition(":")
+            if not sep:
+                return False
+            return secrets.compare_digest(
+                user, basic_auth_username
+            ) and secrets.compare_digest(password, basic_auth_password)
+
+        def _send_auth_required(self, *, send_body: bool) -> None:
+            body = b"Authentication required."
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header(
+                "WWW-Authenticate", f'Basic realm="{BASIC_AUTH_REALM}", charset="UTF-8"'
+            )
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(body)
+
+        def _require_basic_auth(self, *, send_body: bool) -> bool:
+            """Gate access to dashboard content/APIs; health/readiness probes bypass this."""
+            if not auth_enabled or self._has_valid_basic_auth():
+                return True
+            logger.info(
+                "Rejected unauthenticated request to %s from %s",
+                self.path,
+                self.address_string(),
+            )
+            self._send_auth_required(send_body=send_body)
+            return False
 
         def _serve_healthz(self, send_body: bool = True) -> None:
             body = b'{"status":"ok"}'
@@ -730,6 +799,8 @@ def make_handler(
             if parsed.path == "/readyz":
                 self._serve_readyz(send_body=send_body)
                 return
+            if not self._require_basic_auth(send_body=send_body):
+                return
             if parsed.path == "/api/cell-insight":
                 self._serve_cell_insight()
                 return
@@ -776,13 +847,25 @@ def make_handler(
     return DashboardHandler
 
 
-def _prewarm_dashboard_cache(*, logger: logging.Logger, port: int) -> None:
+def _prewarm_dashboard_cache(
+    *,
+    logger: logging.Logger,
+    port: int,
+    basic_auth_username: str | None = None,
+    basic_auth_password: str | None = None,
+) -> None:
     """Request / on loopback so the heavy DB render runs once and lru_cache stays hot."""
     time.sleep(0.35)
     deadline_s = float(os.environ.get("OPERATIONS_KPI_PREWARM_TIMEOUT", "900"))
     url = f"http://127.0.0.1:{port}/"
     t0 = time.perf_counter()
-    req = urllib.request.Request(url, headers={"X-Operations-Kpi-Prewarm": "1"})
+    headers = {"X-Operations-Kpi-Prewarm": "1"}
+    if basic_auth_username and basic_auth_password:
+        token = base64.b64encode(
+            f"{basic_auth_username}:{basic_auth_password}".encode("utf-8")
+        ).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=deadline_s) as resp:
             while True:
@@ -823,12 +906,17 @@ def main() -> None:
     if not template_path.is_file():
         raise FileNotFoundError(f"Template not found: {template_path}")
 
+    basic_auth_username = _basic_auth_username()
+    basic_auth_password = _basic_auth_password()
+
     handler = make_handler(
         template_path,
         database_url=database_url,
         targets_database_url=targets_database_url,
         debug_errors=args.debug_errors,
         logger=logger,
+        basic_auth_username=basic_auth_username,
+        basic_auth_password=basic_auth_password,
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
     serve_thread = threading.Thread(
@@ -861,13 +949,23 @@ def main() -> None:
         "Proxy: increase proxy_read_timeout (see deploy/nginx-proxy-timeouts.conf); "
         "use /healthz for liveness, /readyz for traffic."
     )
+    if basic_auth_username and basic_auth_password:
+        logger.info(
+            "HTTP Basic Auth is required for the dashboard and its APIs "
+            "(/healthz and /readyz remain open for health checks)."
+        )
     if args.prewarm:
         logger.info(
             "Pre-warming dashboard in the background (avoids a multi-minute blank wait on first / in the browser).",
         )
         threading.Thread(
             target=_prewarm_dashboard_cache,
-            kwargs={"logger": logger, "port": args.port},
+            kwargs={
+                "logger": logger,
+                "port": args.port,
+                "basic_auth_username": basic_auth_username,
+                "basic_auth_password": basic_auth_password,
+            },
             daemon=True,
             name="operations-kpi-prewarm",
         ).start()
